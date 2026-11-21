@@ -1,0 +1,137 @@
+# PyVersions
+
+English | [简体中文](README.md)
+
+An interactive PowerShell tool to install, switch, and uninstall **standalone Python** builds ([python-build-standalone](https://github.com/astral-sh/python-build-standalone)) on Windows — with full **multi-version coexistence** support. No installer, no admin rights required (unless you choose an All-Users location), no Python needed beforehand.
+
+```
+  ======================================================
+    PyVersions  v1.5.0
+    Python 独立版 (install_only) 管理工具
+  ======================================================
+  当前权限: 管理员 (写入系统级注册表 / 系统 PATH)
+
+  [1] 下载并部署 Python           (在线, 交互选版本)
+  [2] 离线部署 Python             (罗列脚本目录内的压缩包供选择)
+  [3] 清理 / 卸载指定版本         (注册表 / PATH / 文件)
+  [4] 查看本机已注册的 Python 版本  (可切换主用版本)
+  [0] 退出
+```
+
+## Features
+
+- **Online install** — pick a version interactively (`3.12` for the latest patch, or `3.12.16` for an exact one); downloads from GitHub with automatic mirror fallback (`ghfast.top`, `gh-proxy.com`), resumes from a local cache if the archive already exists.
+- **Offline install** — drop any `*-x86_64-pc-windows-msvc-install_only.tar.gz` into the script directory and PyVersions will list them for selection (by number or version). Multiple builds of the same version show only the newest.
+- **Integrity self-check with fallback** — every build is extracted to a temp dir and health-checked (`import glob, pathlib`) *before* touching your installation; a defective build automatically falls back to the next-newest candidate. The whole install directory is replaced atomically — no mixed old/new stdlib.
+- **Full environment integration** — PEP 514 registry entries (`HKLM`/`HKCU` with automatic privilege-based fallback), `.py`/`.pyc`/`.pyw` file associations, PATH setup (deduplicated, prepended), and a `WM_SETTINGCHANGE` broadcast so new terminals work immediately.
+- **Multi-version coexistence** — each version lives in its own directory (e.g. `D:\Python\python3.12`, `D:\Python\python3.13`). Version-pinned `pip3.12.bat` / `pip3.13.bat` launchers in each `Scripts` folder make `pip` unambiguous.
+- **Safe uninstall** — removes the registry keys, file associations, and PATH entries for a chosen version, optionally the install directory too (with a type-the-version confirmation). Orphaned PATH entries are detected even without registry references.
+- **Association safety for multi-version machines** — when you uninstall a version that currently owns the `.py` association, it is automatically **re-directed to the newest remaining registered version** instead of being deleted; directories still referenced by other versions are never deleted.
+- **Switch the primary version** — view registered versions and promote one to primary: its PATH entries move to the front and the `.py` associations point to it.
+- **Chinese interactive UI** — all prompts and messages are in Simplified Chinese.
+
+## Requirements
+
+| | |
+|---|---|
+| OS | Windows 10 (1803+) / Windows 11 / Windows Server 2019 / 2022 / 2025 |
+| Runtime | Windows PowerShell 5.1 (built in — `powershell.exe`) |
+| Tools | `curl.exe` and `tar.exe` (built in since the versions above); 7-Zip as an optional tar fallback |
+| Network | Only for online install; offline install works fully disconnected |
+
+Older Windows versions are not supported (they lack built-in `curl.exe`).
+
+## Quick Start
+
+```powershell
+# 1. Save PyVersions.ps1 anywhere (e.g. D:\Tools)
+# 2. Run it:
+powershell.exe -ExecutionPolicy Bypass -File PyVersions.ps1
+```
+
+Recommended: right-click the script → *Run with PowerShell*, or create a shortcut with the command above. Admin rights are optional — as admin it writes system-level registry/PATH (HKLM/HKCR); as a normal user it gracefully falls back to per-user locations (HKCU / user PATH).
+
+## Usage
+
+### [1] Download & deploy (online)
+
+1. Enter a version: `3.12` (latest of 3.12.x) or `3.12.16` (exact). Default on Enter: `3.12`.
+2. Choose the install directory (see below).
+3. The archive is downloaded (or reused from the script directory cache), extracted to a temp folder, health-checked, then swapped into place.
+4. Confirm `Y` to auto-import registry / associations / PATH.
+
+### [2] Offline deploy
+
+Place `cpython-*.tar.gz` archives next to the script, then select by number (`1`, `2`) or by version (`3.12`, `3.12.16`). If the newest build fails the self-check, the next-newest is tried automatically.
+
+### [3] Clean / uninstall
+
+Two modes are listed for you to choose:
+
+- **[1] Clean only** — delete the version's registry keys, file associations, and PATH entries (files stay).
+- **[2] Uninstall** — additionally delete the install directory. You must type the full version number to confirm.
+
+### [4] View registered versions / switch primary
+
+Lists every registered Python (registry + PATH, both hives). With two or more valid versions you can **set one as primary**: its PATH entries jump to the front and `.py`/`.pyc`/`.pyw` associations point to it.
+
+### Install locations
+
+Three built-in choices at install time (or type any custom path):
+
+| # | Location | Style |
+|---|---|---|
+| 1 | `D:\Python\python<XY>` (configurable via `$ExtractParentDir`) | PyVersions default |
+| 2 | `%ProgramFiles%\Python<XY>` (resolved via `%ProgramW6432%` in the script) | Official-installer convention, All Users (needs admin) |
+| 3 | `%LocalAppData%\Programs\Python\Python<XY>` | Official-installer convention, current user |
+
+`<XY>` is the version without the dot, e.g. `Python312`.
+
+### pip launchers
+
+Each deployment creates in its `Scripts` folder:
+
+- `pip.bat` — generic entry
+- `pip3.12.bat` / `pip3.13.bat` … — version-pinned pip that works regardless of PATH order, mirroring the official `pip3.X.exe`
+
+## Multi-version behavior explained
+
+| Scenario | What happens to the `.py` file association |
+|---|---|
+| Install A | Association points to A |
+| Install B | Association now points to B (last-installed wins, same as the official installer) |
+| Uninstall B (A remains) | Automatically **re-directed to A** |
+| Uninstall A (association already on B) | Untouched — it doesn't belong to A |
+| Uninstall the only version | Association removed (nothing left to hand over to) |
+| An install directory shared by two registrations | Treated as shared: never deleted during uninstall; associations/PATH for it are preserved |
+
+## How it works
+
+- Version discovery uses the GitHub API of [astral-sh/python-build-standalone](https://github.com/astral-sh/python-build-standalone) (assets named `cpython-<ver>+<date>-x86_64-pc-windows-msvc-install_only.tar.gz`).
+- Registry layout follows [PEP 514](https://peps.python.org/pep-0514/) (`PythonCore\<tag>`), which is what tools like `py.exe` and VS Code scan.
+- The health check exists because some 20261110-era builds shipped with a broken `glob`/`pathlib` chain that only surfaces at `pip` runtime — the check catches exactly that class of defect before it reaches your machine.
+- PATH changes are broadcast via `WM_SETTINGCHANGE`; already-open terminals need to be reopened.
+
+## FAQ
+
+**Q: Do I need admin rights?**
+Only if you pick the All-Users location (`%ProgramFiles%\...`) or want system-level PATH/associations. Otherwise everything works per-user.
+
+**Q: Can I move an installation?**
+Reinstall into the new directory (the old one stays until you uninstall it), then switch the primary version with menu [4].
+
+**Q: A build failed the self-check, what now?**
+Nothing to do — PyVersions deletes the bad archive and falls back to the next-newest build automatically.
+
+**Q: Does it touch existing official Python installations?**
+Uninstall/clean only targets the version you type in. Switching primary versions only reorders PATH and rewrites associations.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+## Acknowledgements
+
+- [astral-sh/python-build-standalone](https://github.com/astral-sh/python-build-standalone) — the upstream build provider
+- [adang1345/PythonWindows](https://github.com/adang1345/PythonWindows) — historical standalone builds (kept as a fallback reference)
+- [ghfast.top](https://ghfast.top/) / [gh-proxy.com](https://gh-proxy.com/) — GitHub download accelerators used as mirror fallbacks
