@@ -6,22 +6,21 @@ An interactive PowerShell tool to install, switch, and uninstall **standalone Py
 
 ```
   ======================================================
-    PyVersions  v1.5.0
+    PyVersions  v1.6.0
     Python 独立版 (install_only) 管理工具
   ======================================================
   当前权限: 管理员 (写入系统级注册表 / 系统 PATH)
 
-  [1] 下载并部署 Python           (在线, 交互选版本)
-  [2] 离线部署 Python             (罗列脚本目录内的压缩包供选择)
-  [3] 清理 / 卸载指定版本         (注册表 / PATH / 文件)
-  [4] 查看本机已注册的 Python 版本  (可切换主用版本)
+  [1] 部署 Python                  (本地离线包 + 在线下载, 自动选择)
+  [2] 清理 / 卸载指定版本          (注册表 / PATH / 文件)
+  [3] 查看本机已注册的 Python 版本  (可切换主用版本)
   [0] 退出
 ```
 
 ## Features
 
-- **Online install** — pick a version interactively (`3.12` for the latest patch, or `3.12.16` for an exact one); downloads from GitHub with automatic mirror fallback (`ghfast.top`, `gh-proxy.com`), resumes from a local cache if the archive already exists.
-- **Offline install** — drop any `*-x86_64-pc-windows-msvc-install_only.tar.gz` into the script directory and PyVersions will list them for selection (by number or version). Multiple builds of the same version show only the newest.
+- **Unified deploy (offline archives + online download in one flow)** — entering deploy lists the offline archives in the script directory and picks the source automatically: a number (`1`) forces the matching archive; an exact version (`3.12.16`) prefers local and falls back to online; a major version (`3.12`) goes **online-first** for the newest build (zero download when the archive is already cached) and degrades to local archives when offline; `o [version]` forces online; with no local archives it goes straight to online mode.
+- **Resilient download** — automatic mirror fallback when GitHub direct fails (`ghfast.top`, `gh-proxy.com`); archives downloaded online are kept in the script directory and automatically become offline candidates next time (cache loop).
 - **Integrity self-check with fallback** — every build is extracted to a temp dir and health-checked (`import glob, pathlib`) *before* touching your installation; a defective build automatically falls back to the next-newest candidate. The whole install directory is replaced atomically — no mixed old/new stdlib.
 - **Full environment integration** — PEP 514 registry entries (`HKLM`/`HKCU` with automatic privilege-based fallback), `.py`/`.pyc`/`.pyw` file associations, PATH setup (deduplicated, prepended), and a `WM_SETTINGCHANGE` broadcast so new terminals work immediately.
 - **Multi-version coexistence** — each version lives in its own directory (e.g. `D:\Python\python3.12`, `D:\Python\python3.13`). Version-pinned `pip3.12.bat` / `pip3.13.bat` launchers in each `Scripts` folder make `pip` unambiguous.
@@ -53,25 +52,30 @@ Recommended: right-click the script → *Run with PowerShell*, or create a short
 
 ## Usage
 
-### [1] Download & deploy (online)
+### [1] Deploy Python (offline + online, unified)
 
-1. Enter a version: `3.12` (latest of 3.12.x) or `3.12.16` (exact). Default on Enter: `3.12`.
-2. Choose the install directory (see below).
-3. The archive is downloaded (or reused from the script directory cache), extracted to a temp folder, health-checked, then swapped into place.
-4. Confirm `Y` to auto-import registry / associations / PATH.
+On entry, offline archives in the script directory are listed (multiple builds of the same version show only the newest). The input picks the source automatically:
 
-### [2] Offline deploy
+| Input | Meaning |
+|---|---|
+| Number (e.g. `1`) | Force-deploy the matching local archive |
+| Exact version (e.g. `3.12.16`) | Local first; if that exact version isn't local, look it up online |
+| Major version (e.g. `3.12`) | **Online-first** for the newest build in that series; zero download if the archive is already cached; auto-**degrade** to local archives on failure |
+| `o [version]` (e.g. `o 3.13`) | **Force online** (ignore local archives); bare `o` means `o 3.12` |
+| Enter | Same as typing `3.12` |
 
-Place `cpython-*.tar.gz` archives next to the script, then select by number (`1`, `2`) or by version (`3.12`, `3.12.16`). If the newest build fails the self-check, the next-newest is tried automatically.
+Then choose the install directory (see below) → prepare the archive (reuse local or download; cached archives skip the download) → extract to a temp folder → health check → swap into place → confirm `Y` to import registry / associations / PATH.
 
-### [3] Clean / uninstall
+If **all** local archives fail the self-check (bad ones are deleted automatically), you can opt to **switch to online install** — the online source offers more historical builds, skipping defective ones. With no local archives at all, it goes straight to online mode.
+
+### [2] Clean / uninstall
 
 Two modes are listed for you to choose:
 
 - **[1] Clean only** — delete the version's registry keys, file associations, and PATH entries (files stay).
 - **[2] Uninstall** — additionally delete the install directory. You must type the full version number to confirm.
 
-### [4] View registered versions / switch primary
+### [3] View registered versions / switch primary
 
 Lists every registered Python (registry + PATH, both hives). With two or more valid versions you can **set one as primary**: its PATH entries jump to the front and `.py`/`.pyc`/`.pyw` associations point to it.
 
@@ -118,7 +122,7 @@ Each deployment creates in its `Scripts` folder:
 Only if you pick the All-Users location (`%ProgramFiles%\...`) or want system-level PATH/associations. Otherwise everything works per-user.
 
 **Q: Can I move an installation?**
-Reinstall into the new directory (the old one stays until you uninstall it), then switch the primary version with menu [4].
+Reinstall into the new directory (the old one stays until you uninstall it), then switch the primary version with menu [3].
 
 **Q: A build failed the self-check, what now?**
 Nothing to do — PyVersions deletes the bad archive and falls back to the next-newest build automatically.

@@ -1,19 +1,21 @@
 ﻿# =========================================================
-#  PyVersions  v1.5.0
+#  PyVersions  v1.6.0
 #  Python 独立版 (install_only) 多版本管理工具
 #  下载源: astral-sh/python-build-standalone (持续更新)
 #
 #  主菜单功能:
-#    [1] 下载并部署 Python (在线) - 交互选版本, 本地压缩包缓存复用,
+#    [1] 部署 Python - 本地离线包 + 在线下载 融合入口:
+#        编号 / 精确版本 (如 3.12.16) 优先使用本地离线包 (本地没有转在线),
+#        大版本 (如 3.12) 在线优先获取最新构建 (本地缓存命中免下载,
+#        断网自动降级本地离线包), o [版本] 强制在线, 无离线包时直接在线;
 #        解压自检通过才安装 (缺陷构建自动回退次新构建),
 #        按版本自动命名安装目录 (如 D:\Python\python3.12, 支持多版本共存,
 #        目录已存在时可选择 覆盖安装 / 跳过部署 / 更换目录),
 #        自动创建 Scripts\pip*.bat, 自动导入注册表与 PATH
-#    [2] 离线部署 Python     - 不联网, 罗列脚本目录内所有离线压缩包供
-#        编号选择 (也可输版本号匹配), 同版本多日期仅显示最新
-#    [3] 清理 / 卸载指定版本 - 二选一: 仅清理注册表键 / 文件关联 / PATH,
-#        或连同安装目录文件一起删除 (卸载需输入版本号二次确认)
-#    [4] 查看本机已注册版本 - 扫描 HKLM/HKCU 注册表与 PATH,
+#    [2] 清理 / 卸载指定版本 - 二选一: 仅清理注册表键 / 文件关联 / PATH,
+#        或连同安装目录文件一起删除 (卸载需输入版本号二次确认;
+#        被其他版本共享的安装目录只清理注册项, 文件保留)
+#    [3] 查看本机已注册版本 - 扫描 HKLM/HKCU 注册表与 PATH,
 #        可将指定版本设为主用 (PATH 置前 + .py 关联指向)
 #
 #  运行方式: powershell.exe -ExecutionPolicy Bypass -File PyVersions.ps1
@@ -236,9 +238,11 @@ function Show-RegisteredPythons {
     if (-not $foundAny) { Write-Host "  (无)" }
 }
 
-# ======================= 功能 1: 在线下载并部署 =======================
+# ============ 功能 1 内部: 在线部署执行体 (供统一部署流程调用) ============
 
-function Invoke-InstallFlow {
+# 在线部署执行体: 代理检测 -> 选版本 -> 查询 GitHub -> 下载/缓存 -> 部署。
+# 返回 $true = 版本已部署 (或保留现有安装); $false = 未完成部署 (统一部署流程可据此降级本地)
+function Invoke-InstallFlow([string]$presetVersion = "") {
     # ---------- 1. 检测系统代理 ----------
     Write-Banner "1. 正在检测系统代理..."
 
@@ -264,15 +268,21 @@ function Invoke-InstallFlow {
     Write-Host ""
 
     $inputVer = $null
-    while ($true) {
+    # 支持从其他流程 (如离线部署失败转在线) 预置版本号, 跳过手动输入
+    if ($presetVersion -match '^[0-9]+\.[0-9]+(\.[0-9]+)?$') {
+        $inputVer = $presetVersion
+        Write-Host "使用指定版本: $inputVer" -ForegroundColor Cyan
+    }
+    while ($null -eq $inputVer) {
         $inputVer = Read-Input "请输入 Python 版本 [默认: $DefaultVersion]"
         if ($null -eq $inputVer) {
             Write-Host "输入已结束, 返回主菜单。" -ForegroundColor Yellow
-            return
+            return $false
         }
         if ([string]::IsNullOrWhiteSpace($inputVer)) { $inputVer = $DefaultVersion }
         if ($inputVer -match '^[0-9]+\.[0-9]+(\.[0-9]+)?$') { break }
         Write-Host "版本号格式无效: [$inputVer], 请输入类似 3.12 或 3.12.13 的格式。" -ForegroundColor Red
+        $inputVer = $null
     }
     Write-Host ""
 
@@ -392,7 +402,7 @@ function Invoke-InstallFlow {
                 Write-Host "未获取到任何 .tar.gz 资源, 请检查网络后重试。" -ForegroundColor Yellow
             }
         }
-        return
+        return $false
     }
 
     Write-Host ""
@@ -408,7 +418,7 @@ function Invoke-InstallFlow {
     $archiveFilePath = Invoke-AssetDownload $bestMatch.Name $bestMatch.Url
     if (-not $archiveFilePath) {
         Write-Host "[错误] 所有线路均下载失败, 请检查网络/代理后重试。" -ForegroundColor Red
-        return
+        return $false
     }
     Write-Host ""
 
@@ -421,10 +431,10 @@ function Invoke-InstallFlow {
     if ($inputVer -match '^([0-9]+\.[0-9]+)') { $pyTagInput = $Matches[1] }
 
     $sel = Get-InstallDestDir $pyTagInput
-    if ($null -eq $sel) { return }
+    if ($null -eq $sel) { return $false }
     if ($sel.Skip) {
         Write-Host "已保留现有安装, 跳过部署。压缩包保留在: $archiveFilePath" -ForegroundColor Yellow
-        return
+        return $true
     }
     $destDir = $sel.Dir
 
@@ -448,15 +458,16 @@ function Invoke-InstallFlow {
 
     if (-not $installedName) {
         Write-Host "[错误] 所有候选构建均部署失败 (下载失败或自检未通过), 请稍后重试。" -ForegroundColor Red
-        return
+        return $false
     }
     if ($installedName -ne $bestMatch.Name) {
         Write-Host "[提示] 最新构建 $($bestMatch.Name) 未通过自检, 已自动回退安装: $($installedName)" -ForegroundColor Yellow
     }
     Write-Host ""
+    return $true
 }
 
-# ============== 安装共用: 安装目录交互 + 部署管线 (功能 1 / 2 共用) ===============
+# ============== 部署共用: 安装目录交互 + 部署管线 (本地 / 在线统一使用) ===============
 
 # 询问安装目录 (默认 D:\Python\python<tag>; 已存在时 O/K/N 交互)。
 # 返回 @{ Dir = 安装目录; Skip = 是否保留现有跳过部署 }; 输入流结束 (EOF) 返回 $null
@@ -514,7 +525,7 @@ function Get-InstallDestDir([string]$pyTagInput) {
     }
 }
 
-# 部署管线 (功能 1 / 2 共用): 解压自检 -> 整体替换 -> pip 脚本 -> 注册表/PATH -> 完成汇总。
+# 部署管线 (本地 / 在线统一使用): 解压自检 -> 整体替换 -> pip 脚本 -> 注册表/PATH -> 完成汇总。
 # 返回 $true = 部署成功; $false = 解压/自检失败 (已清理现场, 调用方可换下一个包重试)
 function Invoke-DeployPipeline([string]$archiveFilePath, [string]$destDir) {
     # 解压到临时目录 (不直接覆盖旧目录, 自检通过后再整体替换)
@@ -759,7 +770,7 @@ function Invoke-DeployPipeline([string]$archiveFilePath, [string]$destDir) {
     return $true
 }
 
-# ======================= 功能 2: 离线部署 (脚本目录内的压缩包) =======================
+# ============ 离线包扫描 (统一部署流程使用) ============
 
 # 扫描脚本目录中的离线压缩包 (任何 *-x86_64-pc-windows-msvc-install_only.tar.gz),
 # 从文件名宽松提取版本号与构建日期; 同一版本多个构建日期仅保留最新的
@@ -798,40 +809,94 @@ function Get-OfflineArchives {
     return $dedup
 }
 
-# 功能 2: 离线部署 —— 不联网, 罗列脚本目录内的压缩包供选择安装
-function Invoke-OfflineInstallFlow {
-    Write-Banner "离线部署 Python (使用脚本目录内的压缩包)"
+# ============ 本地离线包部署 (统一部署流程的本地分支) ============
+
+# 本地离线包部署: 选目录 -> 按候选队列逐个部署 (自检失败自动回退次新包)。
+# 返回 $true = 部署成功 (或保留现有安装); $false = 未完成部署
+function Invoke-LocalDeploy([object]$best, [object[]]$queue, [string]$pyTagInput) {
+    Write-Host ""
+    Write-Host "匹配成功!" -ForegroundColor Green
+    Write-Host "将优先使用: $($best.Name) (构建日期 $($best.DateStr))"
+    if ($queue.Count -gt 1) {
+        Write-Host "另有 $($queue.Count - 1) 个次新包, 自检失败时自动回退。" -ForegroundColor DarkCyan
+    }
+    Write-Host ""
+
+    $sel = Get-InstallDestDir $pyTagInput
+    if ($null -eq $sel) { return $false }
+    if ($sel.Skip) {
+        Write-Host "已保留现有安装, 跳过部署。压缩包保留在: $($best.Path)" -ForegroundColor Yellow
+        return $true
+    }
+
+    $installedName = $null
+    foreach ($cand in $queue) {
+        if ($cand.Name -ne $best.Name) {
+            Write-Host ""
+            Write-Host "自动回退, 尝试次新离线包: $($cand.Name)" -ForegroundColor Cyan
+        }
+        if (Invoke-DeployPipeline $cand.Path $sel.Dir) { $installedName = $cand.Name; break }
+    }
+
+    if (-not $installedName) {
+        Write-Host "[错误] 所有离线压缩包均部署失败 (自检未通过), 请检查压缩包完整性。" -ForegroundColor Red
+        return $false
+    }
+    if ($installedName -ne $best.Name) {
+        Write-Host "[提示] 最新离线包 $($best.Name) 未通过自检, 已自动回退安装: $($installedName)" -ForegroundColor Yellow
+    }
+    Write-Host ""
+    return $true
+}
+
+# 功能 1: 统一部署 —— 本地离线包 + 在线下载 融合入口
+# 输入语义:
+#   编号 (如 1)            -> 强制使用对应离线包
+#   精确版本 (如 3.12.16)  -> 本地优先, 本地无则在线查找同一版本
+#   大版本 (如 3.12)       -> 在线优先获取最新构建 (本地缓存命中免下载), 失败降级本地
+#   o [版本] (如 o 3.13)   -> 强制在线 (忽略本地包); 裸 o 等价 o 3.12
+#   直接回车               -> 等价输入大版本 $DefaultVersion
+function Invoke-DeployFlow {
+    Write-Banner "部署 Python (离线包优先, 支持在线)"
     Write-Host "本功能将:"
-    Write-Host "  - 搜索脚本目录内所有 *-x86_64-pc-windows-msvc-install_only.tar.gz 离线包并罗列"
+    Write-Host "  - 自动扫描脚本目录内所有 *-x86_64-pc-windows-msvc-install_only.tar.gz 离线包并罗列"
     Write-Host "  - 同一版本存在多个构建日期时, 仅显示最新的一个"
-    Write-Host "  - 可输入编号直接选择, 也可输入版本号 (3.12 大版本 / 3.12.16 小版本) 自动匹配"
-    Write-Host "  - 自检失败自动回退次新包, 后续安装流程与 [1] 在线部署完全一致"
+    Write-Host "  - 按输入自动选择 本地离线包 或 在线下载, 后续部署流程完全一致"
     Write-Host ""
 
     $archives = @(Get-OfflineArchives)
     if ($archives.Count -eq 0) {
-        Write-Host "[提示] 脚本目录未发现任何离线压缩包。" -ForegroundColor Yellow
-        Write-Host "  可先通过 [1] 在线部署下载 (压缩包会保留在脚本目录), 或手动将离线包放入脚本目录。" -ForegroundColor Yellow
+        # 无本地包: 直接进入在线模式 (本地无可降级对象, 无需二次确认)
+        Write-Host "[提示] 脚本目录未发现任何离线压缩包, 将直接进入在线模式。" -ForegroundColor Yellow
+        Write-Host "  (在线下载的压缩包会保留在脚本目录, 下次即可作为离线包复用)" -ForegroundColor Yellow
         Write-Host ""
-        Read-Input "按回车键返回主菜单" | Out-Null
+        Invoke-InstallFlow
         return
     }
 
-    # 罗列可选包 (已按版本降序, 同版本多日期仅保留最新)
+    # 罗列本地可选包 (已按版本降序, 同版本多日期仅保留最新)
     Write-Host "发现 $($archives.Count) 个可用的离线压缩包:" -ForegroundColor White
     for ($i = 0; $i -lt $archives.Count; $i++) {
         $a = $archives[$i]
         Write-Host ("  [{0}] {1}  ({2}, 约 {3} MB)" -f ($i + 1), $a.Name, $a.DateStr, [math]::Round((Get-Item $a.Path).Length / 1MB, 1))
     }
     Write-Host ""
+    Write-Host "输入说明:" -ForegroundColor White
+    Write-Host "  - 编号 (如 1)           -> 使用对应离线包部署 (强制本地)"
+    Write-Host "  - 完整版本 (如 3.12.16) -> 优先使用本地同版本包, 本地没有则在线查找"
+    Write-Host "  - 大版本 (如 3.12)      -> 在线获取该系列最新构建 (本地命中缓存则免下载), 失败自动降级本地"
+    Write-Host "  - o [版本] (如 o 3.13)  -> 强制在线 (忽略本地包)"
+    Write-Host "  - 直接回车              -> 等价输入 $DefaultVersion"
+    Write-Host ""
 
-    $pick = Read-Input "请输入编号选择, 或输入版本号 (如 3.12 / 3.12.16, 直接回车取消)"
-    if ($null -eq $pick -or [string]::IsNullOrWhiteSpace($pick)) {
-        Write-Host "已取消离线部署。" -ForegroundColor Yellow
+    $pick = Read-Input "请输入编号 / 版本号 / o [版本] (直接回车 = $DefaultVersion)"
+    if ($null -eq $pick) {
+        Write-Host "输入已结束, 返回主菜单。" -ForegroundColor Yellow
         return
     }
+    if ([string]::IsNullOrWhiteSpace($pick)) { $pick = $DefaultVersion }
 
-    # ---- 方式一: 编号直接选择 ----
+    # ---- 输入 1: 编号 -> 强制本地指定包 ----
     if ($pick -match '^[0-9]+$') {
         $idx = 0
         if (-not [int]::TryParse($pick, [ref]$idx)) {
@@ -848,62 +913,76 @@ function Invoke-OfflineInstallFlow {
         $queue = @($best) + @($archives |
             Where-Object { $_.Name -ne $best.Name -and $_.PyVer.ToString().StartsWith("$pyTagInput.") } |
             Select-Object -First 2)
-    } else {
-        # ---- 方式二: 版本号匹配 (大版本匹配全部 x.y.*, 小版本精确匹配) ----
-        if ($pick -notmatch '^[0-9]+\.[0-9]+(\.[0-9]+)?$') {
-            Write-Host "无效输入: [$pick] (应为编号或版本号, 如 1 / 2 / 3.12 / 3.12.16)。" -ForegroundColor Red
-            return
+        if ((Invoke-LocalDeploy $best $queue $pyTagInput) -eq $false) {
+            # 坏包已被部署管线删除; 转在线可从 GitHub 获取更多历史构建, 绕过缺陷构建
+            if ((Read-YesNo "是否转在线方式重新下载安装 $pyTagInput (需要网络)" "Y") -eq "Y") {
+                Write-Host ""
+                Invoke-InstallFlow $pyTagInput
+            }
         }
-        $pyTagInput = $pick
-        if ($pick -match '^([0-9]+\.[0-9]+)') { $pyTagInput = $Matches[1] }
-        if ($pick -match '^[0-9]+\.[0-9]+$') {
-            $matched = @($archives | Where-Object { $_.PyVer.ToString().StartsWith("$pick.") })
+        return
+    }
+
+    # ---- 输入 2: o [版本] -> 强制在线 ----
+    if ($pick -match '^(?i:o)(\s+([0-9]+\.[0-9]+(\.[0-9]+)?))?\s*$') {
+        $oVer = $Matches[2]
+        if ([string]::IsNullOrEmpty($oVer)) {
+            Invoke-InstallFlow $DefaultVersion        # 裸 o -> 强制在线, 默认大版本
         } else {
-            $matched = @($archives | Where-Object { $_.PyVer -eq [version]$pick })
+            Invoke-InstallFlow $oVer                  # o 3.13 / o 3.13.18
         }
-        if ($matched.Count -eq 0) {
-            Write-Host "[错误] 未找到匹配 [$pick] 的离线压缩包。" -ForegroundColor Red
-            $avail = @()
-            foreach ($a in $archives) { if ($avail -notcontains $a.PyVer.ToString()) { $avail += $a.PyVer.ToString() } }
-            Write-Host "  当前可用的离线包版本: $($avail -join ', ')" -ForegroundColor Yellow
-            return
-        }
-        $best  = $matched[0]   # $archives 已按 版本/日期 降序, 匹配结果天然有序
-        $queue = @($matched | Select-Object -First 3)
-    }
-
-    Write-Host ""
-    Write-Host "匹配成功!" -ForegroundColor Green
-    Write-Host "将优先使用: $($best.Name) (构建日期 $($best.DateStr))"
-    if ($queue.Count -gt 1) {
-        Write-Host "另有 $($queue.Count - 1) 个次新包, 自检失败时自动回退。" -ForegroundColor DarkCyan
-    }
-    Write-Host ""
-
-    $sel = Get-InstallDestDir $pyTagInput
-    if ($null -eq $sel) { return }
-    if ($sel.Skip) {
-        Write-Host "已保留现有安装, 跳过部署。压缩包保留在: $($best.Path)" -ForegroundColor Yellow
         return
     }
 
-    $installedName = $null
-    foreach ($cand in $queue) {
-        if ($cand.Name -ne $best.Name) {
+    # ---- 输入 3: 版本号 ----
+    if ($pick -notmatch '^[0-9]+\.[0-9]+(\.[0-9]+)?$') {
+        Write-Host "无效输入: [$pick] (应为编号 / 版本号 / o [版本])。" -ForegroundColor Red
+        return
+    }
+    $pyTagInput = $pick
+    if ($pick -match '^([0-9]+\.[0-9]+)') { $pyTagInput = $Matches[1] }
+    $isMajor = ($pick -match '^[0-9]+\.[0-9]+$')
+
+    if (-not $isMajor) {
+        # ---- 精确版本 (如 3.12.16): 本地优先, 本地无则在线查找同一版本 ----
+        $matched = @($archives | Where-Object { $_.PyVer -eq [version]$pick })
+        if ($matched.Count -gt 0) {
+            $best  = $matched[0]   # $archives 已按 版本/日期 降序, 匹配结果天然有序
+            $queue = @($matched | Select-Object -First 3)
+            if ((Invoke-LocalDeploy $best $queue $pyTagInput) -eq $false) {
+                if ((Read-YesNo "是否转在线方式重新下载安装 $pyTagInput (需要网络)" "Y") -eq "Y") {
+                    Write-Host ""
+                    Invoke-InstallFlow $pyTagInput
+                }
+            }
+        } else {
+            Write-Host "[提示] 本地没有精确版本 [$pick] 的离线包, 转在线查找。" -ForegroundColor Yellow
             Write-Host ""
-            Write-Host "自动回退, 尝试次新离线包: $($cand.Name)" -ForegroundColor Cyan
+            Invoke-InstallFlow $pick
         }
-        if (Invoke-DeployPipeline $cand.Path $sel.Dir) { $installedName = $cand.Name; break }
-    }
-
-    if (-not $installedName) {
-        Write-Host "[错误] 所有离线压缩包均部署失败 (自检未通过), 请检查压缩包完整性。" -ForegroundColor Red
         return
     }
-    if ($installedName -ne $best.Name) {
-        Write-Host "[提示] 最新离线包 $($best.Name) 未通过自检, 已自动回退安装: $($installedName)" -ForegroundColor Yellow
-    }
+
+    # ---- 大版本 (如 3.12): 在线优先 (最新构建, 本地缓存命中则免下载), 失败降级本地 ----
     Write-Host ""
+    Write-Host "大版本 [$pick]: 优先在线获取该系列最新构建 (本地已有相同压缩包时免下载)..." -ForegroundColor Cyan
+    Write-Host ""
+    if (Invoke-InstallFlow $pick) { return }
+
+    Write-Host ""
+    Write-Host "在线部署未完成, 自动降级: 尝试本地离线包 [$pick.x] ..." -ForegroundColor Yellow
+    $matched = @($archives | Where-Object { $_.PyVer.ToString().StartsWith("$pick.") })
+    if ($matched.Count -eq 0) {
+        Write-Host "[错误] 本地也没有匹配 [$pick] 的离线压缩包。" -ForegroundColor Red
+        $avail = @()
+        foreach ($a in $archives) { if ($avail -notcontains $a.PyVer.ToString()) { $avail += $a.PyVer.ToString() } }
+        Write-Host "  当前可用的离线包版本: $($avail -join ', ')" -ForegroundColor Yellow
+        return
+    }
+    $best  = $matched[0]
+    $queue = @($matched | Select-Object -First 3)
+    Invoke-LocalDeploy $best $queue $pyTagInput | Out-Null
+    # 注: 此分支在线已失败过, 不再重复提示转在线
 }
 
 # ============== 清理/卸载共用: 识别与执行 ==============
@@ -1463,7 +1542,7 @@ function Show-MainMenu {
     Write-Host ""
     Write-Host "  ======================================================" -ForegroundColor Cyan
     Write-Host "    PyVersions  " -ForegroundColor Cyan -NoNewline
-    Write-Host "v1.5.0" -ForegroundColor Yellow
+    Write-Host "v1.6.0" -ForegroundColor Yellow
     Write-Host "    Python 独立版 (install_only) 管理工具" -ForegroundColor DarkGray
     Write-Host "  ======================================================" -ForegroundColor Cyan
     Write-Host "  当前权限: " -NoNewline
@@ -1476,10 +1555,9 @@ function Show-MainMenu {
     }
     Write-Host ""
     $items = @(
-        @{ Key = "1"; Title = "下载并部署 Python";             Desc = "(在线, 交互选版本)" },
-        @{ Key = "2"; Title = "离线部署 Python";               Desc = "(罗列脚本目录内的压缩包供选择)" },
-        @{ Key = "3"; Title = "清理 / 卸载指定版本";           Desc = "(注册表 / PATH / 文件)" },
-        @{ Key = "4"; Title = "查看本机已注册的 Python 版本";  Desc = "(可切换主用版本)" },
+        @{ Key = "1"; Title = "部署 Python";                   Desc = "(本地离线包 + 在线下载, 自动选择)" },
+        @{ Key = "2"; Title = "清理 / 卸载指定版本";           Desc = "(注册表 / PATH / 文件)" },
+        @{ Key = "3"; Title = "查看本机已注册的 Python 版本";  Desc = "(可切换主用版本)" },
         @{ Key = "0"; Title = "退出";                          Desc = "" }
     )
     # 标题列统一宽度: 以最长标题的显示宽度为基准, 说明列从同一位置起
@@ -1515,10 +1593,9 @@ while ($true) {
         break
     }
     switch ($choice) {
-        "1" { Invoke-InstallFlow }
-        "2" { Invoke-OfflineInstallFlow }
-        "3" { Invoke-CleanOrUninstallFlow }
-        "4" { Invoke-ShowFlow }
-        default { Write-Host "无效选项: [$choice], 请输入 0-4。" -ForegroundColor Red }
+        "1" { Invoke-DeployFlow }
+        "2" { Invoke-CleanOrUninstallFlow }
+        "3" { Invoke-ShowFlow }
+        default { Write-Host "无效选项: [$choice], 请输入 0-3。" -ForegroundColor Red }
     }
 }
