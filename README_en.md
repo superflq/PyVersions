@@ -6,7 +6,7 @@ An interactive PowerShell tool to install, switch, and uninstall **standalone Py
 
 ```
   ======================================================
-    PyVersions  v1.8.3
+    PyVersions  v1.8.5
     Python 独立版 (install_only) 管理工具
   ======================================================
   当前权限: 管理员 (写入系统级注册表 / 系统 PATH)

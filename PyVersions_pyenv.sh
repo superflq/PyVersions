@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================================
 # 脚本名称: PyVersions_pyenv.sh
-# 版本:     v1.8.3 (与 PyVersions.ps1 同步演进)
+# 版本:     v1.8.5 (定稿) (与 PyVersions.ps1 同步演进)
 # 适用系统: CentOS 7+, Debian 10+, Ubuntu 18.04+ (支持 x86_64 / aarch64)
 # 功能描述: 免编译一键安装指定版本 Python —— 使用 python-build-standalone
 #           官方预编译包(含 SHA256 完整性校验与标准库/pip 健康自检), 由 pyenv 统一管理,
@@ -116,8 +116,13 @@ setup_proxy() {
     GIT_PROXY_ARGS=""
     # 1. 用户预设的代理环境变量: 直接沿用 (优先级最高, 不做任何改动)
     if [ -n "${http_proxy:-}" ] || [ -n "${https_proxy:-}" ] || [ -n "${HTTP_PROXY:-}" ] || [ -n "${HTTPS_PROXY:-}" ]; then
-        ACTIVE_PROXY="${http_proxy:-${https_proxy:-${HTTP_PROXY:-${HTTPS_PROXY:-}}}}"
-        echo "使用预设代理环境变量: $ACTIVE_PROXY (不改动任何配置)。"
+        local src_var
+        if   [ -n "${http_proxy:-}"  ]; then src_var="http_proxy";  ACTIVE_PROXY="$http_proxy"
+        elif [ -n "${https_proxy:-}" ]; then src_var="https_proxy"; ACTIVE_PROXY="$https_proxy"
+        elif [ -n "${HTTP_PROXY:-}"  ]; then src_var="HTTP_PROXY";  ACTIVE_PROXY="$HTTP_PROXY"
+        else                              src_var="HTTPS_PROXY"; ACTIVE_PROXY="$HTTPS_PROXY"
+        fi
+        echo "使用预设代理环境变量 ($src_var): $ACTIVE_PROXY (不改动任何配置)。"
         return 0
     fi
     # 2. 局域网代理探测: 连通即用于本次下载
@@ -764,7 +769,7 @@ interactive_menu() {
     while true; do
         echo ""
         echo "  ======================================================"
-        echo "    PyVersions_pyenv  v1.8.3"
+        echo "    PyVersions_pyenv  v1.8.5"
         echo "    Python 独立版 (install_only) 管理工具 · pyenv 托管"
         echo "  ======================================================"
         echo "  pyenv 根目录: $PYENV_ROOT"

@@ -1,5 +1,5 @@
 ﻿# =========================================================
-#  PyVersions  v1.8.3
+#  PyVersions  v1.8.5 (定稿)
 #  Python 独立版 (install_only) 多版本管理工具
 #  下载源: astral-sh/python-build-standalone (持续更新)
 #
@@ -286,10 +286,12 @@ function Set-DownloadProxy {
     $script:ActiveProxy   = ""
     $script:CurlProxyArgs = @()
     # 1. 用户预设的代理环境变量: 直接沿用 (优先级最高, 不做任何改动)
+    #    (Windows 环境变量名不区分大小写, $env:http_proxy 已涵盖 HTTP_PROXY/HTTPS_PROXY)
     if ($env:http_proxy -or $env:https_proxy) {
+        $srcVar = if ($env:http_proxy) { "http_proxy" } else { "https_proxy" }
         $script:ActiveProxy   = if ($env:http_proxy) { $env:http_proxy } else { $env:https_proxy }
         $script:CurlProxyArgs = @("-x", $script:ActiveProxy)
-        Write-Host "使用预设代理环境变量: $script:ActiveProxy (不改动任何配置)" -ForegroundColor DarkGray
+        Write-Host "使用预设代理环境变量 ($srcVar): $script:ActiveProxy (不改动任何配置)" -ForegroundColor DarkGray
         return
     }
     # 2. 局域网代理探测: 连通即用于本次下载
@@ -1855,7 +1857,7 @@ function Show-MainMenu {
     Write-Host ""
     Write-Host "  ======================================================" -ForegroundColor Cyan
     Write-Host "    PyVersions  " -ForegroundColor Cyan -NoNewline
-    Write-Host "v1.8.3" -ForegroundColor Yellow
+    Write-Host "v1.8.5" -ForegroundColor Yellow
     Write-Host "    Python 独立版 (install_only) 管理工具" -ForegroundColor DarkGray
     Write-Host "  ======================================================" -ForegroundColor Cyan
     Write-Host "  当前权限: " -NoNewline
