@@ -6,7 +6,7 @@
 
 ```
   ======================================================
-    PyVersions  v1.6.0
+    PyVersions  v1.8.0
     Python 独立版 (install_only) 管理工具
   ======================================================
   当前权限: 管理员 (写入系统级注册表 / 系统 PATH)
@@ -20,8 +20,14 @@
 ## 功能特性
 
 - **统一部署（离线包 + 在线下载融合）** — 进入部署自动罗列脚本目录内的离线压缩包，按输入自动选择来源：编号（如 `1`）强制用对应离线包；完整版本（如 `3.12.16`）本地优先、没有转在线；大版本（如 `3.12`）在线优先取最新构建（本地已有相同压缩包时零下载）、断网自动降级本地；`o [版本]` 强制在线；脚本目录无离线包时直接进入在线模式。
+- **启动参数直接部署** — `PyVersions.ps1 3.12` / `PyVersions.ps1 3.12.16` 免交互直接部署（语义与交互输入一致），`-h` 显示帮助；退出码 `0` 成功 / `1` 失败，便于脚本化调用。无参数则进入交互主菜单。
+- **零 API 版本发现** — 通过 `releases/latest` HTTP 302 重定向 + `releases.atom` 动态获取上游最新构建标签（不受 GitHub API 限流影响），GitHub API 作为旧大版本盲区的回退通道；再按 Tag 拉取 `SHA256SUMS` 清单（几十 KB）匹配出精确候选。
+- **SHA256 完整性校验** — 下载的压缩包逐一对照上游 `SHA256SUMS` 清单校验，坏包自动删除并回退次新候选；校验清单按 Release 标签缓存在脚本目录（`SHA256SUMS-<tag>`），命中免重复下载。
+- **缓存治理** — 部署成功后自动清理同精确版本的旧日期缓存包（仅保留本次使用的最新包）；部署过程中的临时解压目录（`.py_deploy_*`）在每次部署开始时自动清扫，异常中断的残留不会累积。
+- **局域网代理加速** — 下载前优先 TCP 探测局域网代理列表（默认 200ms 超时），连通即启用；未命中再回退系统代理 / 直连，与 Linux 版 `PyVersions_pyenv.sh` 行为一致。
 - **下载稳健** — GitHub 直连失败自动切换镜像（`ghfast.top`、`gh-proxy.com`）；在线下载的压缩包保留在脚本目录，下次自动成为离线候选（缓存闭环）。
-- **自检 + 自动回退** — 每个构建先解压到临时目录做健康检查（`import glob, pathlib`），通过后才替换正式目录；缺陷构建自动回退次新候选。整体替换安装目录，绝不新旧 stdlib 混杂。
+- **自检 + 自动回退** — 每个构建先解压到临时目录做健康检查（`import glob, pathlib, pip`），通过后才替换正式目录；缺陷构建自动回退次新候选。整体替换安装目录，绝不新旧 stdlib 混杂。
+- **幂等部署** — 目标目录已存在时默认**保留现有安装**（回车即跳过），确认后才覆盖或更换目录，避免误清第三方包。
 - **环境全自动集成** — PEP 514 注册表（`HKLM`/`HKCU` 按权限自动降级）、`.py`/`.pyc`/`.pyw` 文件关联、PATH 去重置前、`WM_SETTINGCHANGE` 广播（新开终端即刻可用）。
 - **多版本共存** — 每个版本独立目录（如 `D:\Python\python3.12`、`python3.13`）；各 `Scripts` 下生成版本锁定的 `pip3.12.bat` / `pip3.13.bat`，不受 PATH 顺序影响。
 - **安全卸载** — 按版本删除注册表键 / 文件关联 / PATH 条目，可选连同安装目录（需完整输入版本号二次确认）；孤儿 PATH 条目（无注册表引用）也能识别清理。
@@ -44,13 +50,27 @@
 
 ```powershell
 # 1. 把 PyVersions.ps1 放到任意目录 (如 D:\Tools)
-# 2. 运行:
+# 2. 交互菜单:
 powershell.exe -ExecutionPolicy Bypass -File PyVersions.ps1
+# 3. 或直接部署指定版本:
+powershell.exe -ExecutionPolicy Bypass -File PyVersions.ps1 3.12
+powershell.exe -ExecutionPolicy Bypass -File PyVersions.ps1 3.12.16
 ```
 
 推荐右键脚本 → *使用 PowerShell 运行*，或按上述命令创建快捷方式。管理员权限可选——管理员写入系统级注册表/PATH（HKLM/HKCR），普通用户自动降级为当前用户位置（HKCU / 用户 PATH）。
 
 ## 使用说明
+
+### 启动参数模式
+
+| 命令 | 语义 |
+|---|---|
+| `PyVersions.ps1` | 进入交互主菜单 |
+| `PyVersions.ps1 3.12` | 直接部署 3.12 系列（大版本语义：在线优先 + 失败降级本地） |
+| `PyVersions.ps1 3.12.16` | 直接部署精确版本（本地优先，本地无则在线） |
+| `PyVersions.ps1 -h` / `--help` | 显示帮助 |
+
+参数模式退出码：`0` 部署成功（或保留现有安装），`1` 部署失败或参数无效；部署过程中的确认项（安装目录 / 覆盖确认 / 注册表导入）仍按交互进行，管道输入 EOF 时按默认值处理（保留现有安装 / 跳过导入）。
 
 ### [1] 部署 Python（离线包 + 在线 融合）
 
@@ -77,7 +97,7 @@ powershell.exe -ExecutionPolicy Bypass -File PyVersions.ps1
 
 ### [3] 查看已注册版本 / 切换主用
 
-罗列本机全部已注册 Python（注册表 + PATH，双 hive）。存在两个及以上有效版本时可**设为主用**：PATH 条目置前，`.py`/`.pyc`/`.pyw` 关联指向它。
+罗列本机全部已注册 Python（注册表 + PATH，双 hive）。存在两个及以上有效版本时可**设为主用**：PATH 条目置前，`.py`/`.pyc`/`.pyw` 关联指向它；当前主用版本以绿色 `***` 标注。
 
 ### 安装目录
 
@@ -89,7 +109,11 @@ powershell.exe -ExecutionPolicy Bypass -File PyVersions.ps1
 | 2 | `%ProgramFiles%\Python<XY>`（脚本内经 `%ProgramW6432%` 解析，避开 32 位进程重定向） | 官方安装器惯例，All Users（需管理员） |
 | 3 | `%LocalAppData%\Programs\Python\Python<XY>` | 官方安装器惯例，当前用户 |
 
-`<XY>` 为去掉点号的版本号，如 `Python312`。
+`<XY>` 为去掉点号的版本号，如 `Python312`。自定义路径的父级目录不存在时会自动**逐层创建**；不可达的盘符 / 网络共享在选择时即时拦截提示；安装目录不能位于盘根 / 共享根。目标目录已存在时可选 **覆盖安装 / 保留现有安装（默认）/ 更换目录**——直接回车保留现有安装，幂等重跑不会误清第三方包。
+
+### 局域网代理加速
+
+脚本内 `$GlobalProxyUrls` 预置了局域网代理候选（如 `http://localhost:56666`），每次部署前逐个 TCP 探测（200ms 超时），首个连通者**按次用于本次下载**（`curl -x` / `-Proxy` 参数传入）——**不改动系统代理配置，也不改写代理环境变量**；已预设 `http_proxy`/`https_proxy` 时直接沿用；全部不可达时回退系统代理，再回退直连。按需修改脚本配置区即可适配自己的内网环境。
 
 ### pip 启动脚本
 
@@ -111,7 +135,7 @@ powershell.exe -ExecutionPolicy Bypass -File PyVersions.ps1
 
 ## 工作原理
 
-- 版本发现走 [astral-sh/python-build-standalone](https://github.com/astral-sh/python-build-standalone) 的 GitHub API（资源名 `cpython-<ver>+<date>-x86_64-pc-windows-msvc-install_only.tar.gz`）。
+- 版本发现走 [astral-sh/python-build-standalone](https://github.com/astral-sh/python-build-standalone)：优先零 API 通道（`releases/latest` HTTP 302 重定向 + `releases.atom` 提取最近 3 个标签），GitHub API 作为旧大版本盲区的回退；再按标签拉取 `SHA256SUMS` 清单匹配资源名 `cpython-<ver>+<date>-x86_64-pc-windows-msvc-install_only.tar.gz` 并用于完整性校验。
 - 注册表遵循 [PEP 514](https://peps.python.org/pep-0514/)（`PythonCore\<tag>`），`py.exe`、VS Code 等工具均按此扫描。
 - 健康检查的由来：部分 20261110 期构建的 `glob`/`pathlib` 链路存在缺陷，只在 pip 运行时暴露——自检正是为了在进入你的机器前拦住这类问题。
 - PATH 变更通过 `WM_SETTINGCHANGE` 广播；已打开的终端需要重开。

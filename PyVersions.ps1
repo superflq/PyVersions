@@ -1,5 +1,5 @@
 ﻿# =========================================================
-#  PyVersions  v1.6.0
+#  PyVersions  v1.8.0
 #  Python 独立版 (install_only) 多版本管理工具
 #  下载源: astral-sh/python-build-standalone (持续更新)
 #
@@ -18,13 +18,21 @@
 #    [3] 查看本机已注册版本 - 扫描 HKLM/HKCU 注册表与 PATH,
 #        可将指定版本设为主用 (PATH 置前 + .py 关联指向)
 #
-#  运行方式: powershell.exe -ExecutionPolicy Bypass -File PyVersions.ps1
+#  运行方式: powershell.exe -ExecutionPolicy Bypass -File PyVersions.ps1 [版本号]
+#  启动参数: PyVersions.ps1 3.12      直接部署 3.12 系列 (大版本语义: 在线优先+断网降级)
+#            PyVersions.ps1 3.12.16  直接部署精确版本 (本地优先, 无则在线)
+#            PyVersions.ps1 --help   显示帮助; 无参数进入交互主菜单
 #  系统要求: Windows 10 (1803+) / Windows 11 / Windows Server 2019/2022/2025
 #            (系统自带 curl 与 tar, 开箱即用), 不支持更早版本系统
 #
 #  注意: 本文件必须以 UTF-8 with BOM 编码保存,
 #        否则中文在 Windows PowerShell 5.1 下会乱码
 # =========================================================
+
+param(
+    [Parameter(Position = 0)][string]$InputVersion = "",   # 启动参数: 直接部署指定版本, 空则进入交互菜单
+    [switch]$Help                                           # 显示帮助
+)
 
 $ErrorActionPreference = 'Stop'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -50,6 +58,15 @@ $AllUsersRoot     = if ($env:ProgramW6432) { $env:ProgramW6432 } else { $env:Pro
 $UserRoot         = Join-Path $env:LOCALAPPDATA "Programs\Python" # 当前用户安装 (无需管理员)
 # 下载加速线路 (按顺序尝试; 留空字符串表示 GitHub 直连。镜像失效会自动换下一线路)
 $DownloadMirrors  = @("", "https://ghfast.top/", "https://gh-proxy.com/")
+# 局域网代理加速 (优先于系统代理; 逐个 TCP 探测, 200ms 内连通即启用)
+$GlobalProxyUrls     = @(
+    "http://localhost:56666",
+    "http://192.168.1.10:56666",
+    "http://192.168.1.88:56666",
+    "http://10.175.167.167:56666"
+)
+# 探测超时(毫秒): 与 .sh 的 timeout 0.2s 对齐 = 200ms; 注意单位是毫秒, 勿误填 0.2 (那是 0.2ms 恒失败)
+$ProxyProbeTimeoutMs = 200
 # -------------------------------------------------------
 
 $SevenZipExe = "C:\Program Files\7-Zip\7z.exe"
@@ -114,6 +131,7 @@ function Invoke-EnvBroadcast {
 # 获取单个资源压缩包: 本地已有同名文件(>1MB)则直接复用不重复下载,
 # 否则按 直连/镜像 依次尝试下载。成功返回本地路径, 失败返回 $null
 function Invoke-AssetDownload([string]$assetName, [string]$assetUrl) {
+    $pa = $script:CurlProxyArgs   # 按次传入代理 (-x), 不依赖/不改写环境变量
     if (Test-Path $assetName) {
         $localItem = Get-Item $assetName -ErrorAction SilentlyContinue
         if ($localItem -and $localItem.Length -gt 1MB) {
@@ -137,7 +155,7 @@ function Invoke-AssetDownload([string]$assetName, [string]$assetUrl) {
         if ($mirror) { Write-Host "正在通过加速镜像下载: $mirror" -ForegroundColor Cyan }
         else         { Write-Host "正在通过 GitHub 直连下载..." -ForegroundColor Cyan }
 
-        & curl.exe -f -L --retry 3 --retry-delay 2 --connect-timeout 20 --ssl-no-revoke -o "$assetName" "$tryUrl"
+        & curl.exe @pa -f -L --retry 3 --retry-delay 2 --connect-timeout 20 --ssl-no-revoke -o "$assetName" "$tryUrl"
         if ($LASTEXITCODE -eq 0 -and (Test-Path $assetName) -and ((Get-Item $assetName).Length -gt 1MB)) {
             $okPath = (Resolve-Path $assetName).Path
             Write-Host "下载完成: $okPath" -ForegroundColor Green
@@ -238,57 +256,154 @@ function Show-RegisteredPythons {
     if (-not $foundAny) { Write-Host "  (无)" }
 }
 
-# ============ 功能 1 内部: 在线部署执行体 (供统一部署流程调用) ============
+# ====== 下载代理解析 (局域网代理优先 -> 系统代理 -> 直连) ======
 
-# 在线部署执行体: 代理检测 -> 选版本 -> 查询 GitHub -> 下载/缓存 -> 部署。
-# 返回 $true = 版本已部署 (或保留现有安装); $false = 未完成部署 (统一部署流程可据此降级本地)
-function Invoke-InstallFlow([string]$presetVersion = "") {
-    # ---------- 1. 检测系统代理 ----------
-    Write-Banner "1. 正在检测系统代理..."
+# 探测局域网代理: 逐个 TCP 连通性测试, 返回第一个可用地址 (无则 $null)
+function Get-AvailableProxy {
+    foreach ($proxy in $GlobalProxyUrls) {
+        $tcpClient = $null
+        try {
+            $uri = [Uri]$proxy
+            $tcpClient = [System.Net.Sockets.TcpClient]::new()
+            $connectTask = $tcpClient.ConnectAsync($uri.Host, $uri.Port)
+            if ($connectTask.Wait($ProxyProbeTimeoutMs) -and $tcpClient.Connected) {
+                return $proxy
+            }
+        } catch {
+        } finally {
+            if ($null -ne $tcpClient) {
+                try { $tcpClient.Close() } catch { }
+                try { $tcpClient.Dispose() } catch { }
+            }
+        }
+    }
+    return $null
+}
 
+# 每次进入在线流程前调用: 解析下载代理。结果按次传给 curl (-x) / Invoke-RestMethod (-Proxy),
+# 不改写 http_proxy/https_proxy 环境变量, 也不改动系统代理配置 (局域网代理只是"拿来用", 不是"替换")
+function Set-DownloadProxy {
+    $script:ActiveProxy   = ""
+    $script:CurlProxyArgs = @()
+    # 1. 用户预设的代理环境变量: 直接沿用 (优先级最高, 不做任何改动)
+    if ($env:http_proxy -or $env:https_proxy) {
+        $script:ActiveProxy   = if ($env:http_proxy) { $env:http_proxy } else { $env:https_proxy }
+        $script:CurlProxyArgs = @("-x", $script:ActiveProxy)
+        Write-Host "使用预设代理环境变量: $script:ActiveProxy (不改动任何配置)" -ForegroundColor DarkGray
+        return
+    }
+    # 2. 局域网代理探测: 连通即用于本次下载
+    $lanProxy = Get-AvailableProxy
+    if ($lanProxy) {
+        $script:ActiveProxy   = $lanProxy
+        $script:CurlProxyArgs = @("-x", $lanProxy)
+        Write-Host "已启用局域网代理加速: $lanProxy (仅用于本次下载, 不改动系统代理配置)" -ForegroundColor Green
+        return
+    }
+    Write-Host "未发现可用的局域网代理, 尝试系统代理..." -ForegroundColor DarkGray
+    # 3. 系统代理 (WinINET): 读取后同样按次使用, 不写回任何配置
     $regProxy = Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue
     if ($regProxy.ProxyEnable -eq 1 -and $regProxy.ProxyServer) {
         $rawProxy = ($regProxy.ProxyServer -split ';')[0]
         $sysProxy = if ($rawProxy -match '=') { ($rawProxy -split '=')[1] } else { $rawProxy }
         if ($sysProxy -notmatch '^https?://') { $sysProxy = "http://$sysProxy" }
-        $env:http_proxy  = $sysProxy
-        $env:https_proxy = $sysProxy
-        Write-Host "已检测到系统代理并应用: $sysProxy" -ForegroundColor Green
+        $script:ActiveProxy   = $sysProxy
+        $script:CurlProxyArgs = @("-x", $sysProxy)
+        Write-Host "已检测到系统代理并按次应用: $sysProxy (不改动其配置)" -ForegroundColor Green
     } else {
-        Write-Host "未启用系统代理, 将使用直连/TUN 模式。" -ForegroundColor Yellow
+        Write-Host "未启用任何代理, 将使用直连/TUN 模式。" -ForegroundColor Yellow
     }
-    Write-Host ""
+}
 
-    # ---------- 2. 选择 Python 版本 ----------
-    Write-Banner "2. 选择 Python 版本"
-    Write-Host "提示:"
-    Write-Host "  - 输入 大版本.小版本 (如 3.12)   -> 自动选择 3.12.x 中补丁号最高、构建日期最新的包"
-    Write-Host "  - 输入 完整版本号 (如 3.12.13)  -> 下载 3.12.13 中构建日期最新的包"
-    Write-Host "  - 直接回车                     -> 默认使用 $DefaultVersion"
-    Write-Host ""
+# ====== 上游构建发现 (零 API 优先, 参考 PyVersions_pyenv.sh 统一策略) ======
 
-    $inputVer = $null
-    # 支持从其他流程 (如离线部署失败转在线) 预置版本号, 跳过手动输入
-    if ($presetVersion -match '^[0-9]+\.[0-9]+(\.[0-9]+)?$') {
-        $inputVer = $presetVersion
-        Write-Host "使用指定版本: $inputVer" -ForegroundColor Cyan
-    }
-    while ($null -eq $inputVer) {
-        $inputVer = Read-Input "请输入 Python 版本 [默认: $DefaultVersion]"
-        if ($null -eq $inputVer) {
-            Write-Host "输入已结束, 返回主菜单。" -ForegroundColor Yellow
-            return $false
+# 获取指定 Release tag 的 SHA256SUMS 清单 (脚本目录缓存复用, 仅几十 KB); 失败返回 $null
+function Get-SumsFile([string]$tag) {
+    $pa = $script:CurlProxyArgs
+    $cached = Join-Path $PSScriptRoot "SHA256SUMS-$tag"
+    if (Test-Path $cached) { return $cached }
+    $sumsUrl = "https://github.com/astral-sh/python-build-standalone/releases/download/$tag/SHA256SUMS"
+    foreach ($mirror in $DownloadMirrors) {
+        $tmp = "$cached.part"
+        & curl.exe @pa -fsSL --retry 2 --connect-timeout 12 "${mirror}${sumsUrl}" -o "$tmp" 2>$null
+        if ($LASTEXITCODE -eq 0 -and (Test-Path $tmp) -and (Get-Item $tmp).Length -gt 0) {
+            Move-Item -Path $tmp -Destination $cached -Force
+            return $cached
         }
-        if ([string]::IsNullOrWhiteSpace($inputVer)) { $inputVer = $DefaultVersion }
-        if ($inputVer -match '^[0-9]+\.[0-9]+(\.[0-9]+)?$') { break }
-        Write-Host "版本号格式无效: [$inputVer], 请输入类似 3.12 或 3.12.13 的格式。" -ForegroundColor Red
-        $inputVer = $null
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
     }
-    Write-Host ""
+    return $null
+}
 
-    # ---------- 3. 查询 GitHub Releases ----------
-    Write-Banner "3. 正在查询 GitHub Releases [$inputVer] ..."
+# 轻量上游发现 (零 API, 不受限流影响):
+# releases/latest 302 重定向取最新 tag + releases.atom 取次新 tag -> SHA256SUMS 文件名精确匹配。
+# 失败细节写入 $script:NetworkErrors / $script:AnyRepoOk / $script:SampleNames 供报错展示。
+function Get-UpstreamCandidatesLight([string]$inputVer) {
+    $script:SampleNames = @(); $script:NetworkErrors = @(); $script:AnyRepoOk = $false
+    $ownerRepo = "astral-sh/python-build-standalone"
+    $tags      = @()
+    $pa = $script:CurlProxyArgs   # 按次传入代理 (-x), 不依赖/不改写环境变量
 
+    # 1) releases/latest 302 重定向取最新 tag
+    $headOut = (& curl.exe @pa -sI --connect-timeout 10 "https://github.com/$ownerRepo/releases/latest" 2>$null | Out-String)
+    if ($headOut -match 'location:\s*\S*?tag/([0-9]{8})') { $tags += $Matches[1] }
+
+    # 2) releases.atom 取最近 3 个 tag (多线路, 兼作次新构建回退来源)
+    foreach ($mirror in $DownloadMirrors) {
+        $atom = (& curl.exe @pa -fsSL --connect-timeout 10 "${mirror}https://github.com/$ownerRepo/releases.atom" 2>$null | Out-String)
+        if ($atom) {
+            $atomTags = @([regex]::Matches($atom, 'releases/tag/([0-9]{8})') | ForEach-Object { $_.Groups[1].Value } | Select-Object -Unique)
+            foreach ($t in $atomTags) {
+                if ($tags -inotcontains $t) { $tags += $t }
+                if ($tags.Count -ge 3) { break }
+            }
+            if ($tags.Count -ge 2) { break }
+        }
+    }
+    if ($tags.Count -eq 0) {
+        $script:NetworkErrors += "轻量发现: 未能获取任何 Release 标签 (网络不通或镜像不可用)"
+        return @()
+    }
+    $script:AnyRepoOk = $true
+
+    # 3) 逐 tag 检索 SHA256SUMS, 按文件名精确匹配 (大版本匹配 x.y.* / 精确版本锁定)
+    $escapedVer = [regex]::Escape($inputVer)
+    $escapedArch = [regex]::Escape($TargetArch)
+    if ($inputVer -match '^[0-9]+\.[0-9]+$') {
+        $pat = "^c?python-${escapedVer}\.[0-9]+\+"
+    } else {
+        $pat = "^c?python-${escapedVer}\+"
+    }
+    $candidates = @()
+    foreach ($t in $tags) {
+        $sumsFile = Get-SumsFile $t
+        if (-not $sumsFile) { continue }
+        foreach ($line in @(Get-Content $sumsFile -ErrorAction SilentlyContinue)) {
+            # SHA256SUMS 行格式: <sha256><空白><空格或*>文件名
+            if ($line -match '^([0-9a-fA-F]{64})\s+\*?(.+)$') {
+                $fname = $Matches[2].Trim()
+                if ($fname -notmatch ($pat + $t + "-" + $escapedArch + "$")) { continue }
+                if ($fname -notmatch '^c?python-([0-9]+\.[0-9]+\.[0-9]+)\+') { continue }
+                $candidates += [PSCustomObject]@{
+                    Name      = $fname
+                    Url       = "https://github.com/$ownerRepo/releases/download/$t/$fname"
+                    PyVer     = [version]$Matches[1]
+                    BuildDate = [int64]($t + "000000")
+                    Tag       = $t
+                    Repo      = $ownerRepo
+                }
+            }
+        }
+        if ($candidates.Count -ge 2) { break }   # 最新 tag 已命中, 无需更多
+    }
+    return @($candidates |
+        Sort-Object -Property @{ Expression = "PyVer"; Descending = $true }, @{ Expression = "BuildDate"; Descending = $true })
+}
+
+# GitHub API 发现 (回退线路: 轻量发现无结果时使用, 覆盖 atom 时效外的历史版本)
+# 失败细节写入 $script:NetworkErrors / $script:AnyRepoOk / $script:SampleNames
+function Get-UpstreamCandidatesViaApi([string]$inputVer) {
+    $script:SampleNames = @(); $script:NetworkErrors = @(); $script:AnyRepoOk = $false
     $escapedVer  = [regex]::Escape($inputVer)
     $escapedArch = [regex]::Escape($TargetArch)
     # 版本号后必须紧跟 + 或 -, 以排除 3.16.0a1 / 3.14.0rc1 等预发布版
@@ -298,10 +413,7 @@ function Invoke-InstallFlow([string]$presetVersion = "") {
         $namePattern = "^c?python-${escapedVer}[\+\-].*${escapedArch}$"
     }
 
-    $candidates    = @()
-    $sampleNames   = @()
-    $networkErrors = @()
-    $anyRepoOk     = $false
+    $candidates = @()
     $headers = @{
         "User-Agent" = "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
         "Accept"     = "application/vnd.github+json"
@@ -320,7 +432,9 @@ function Invoke-InstallFlow([string]$presetVersion = "") {
             # 每次请求自动重试 3 次, 应对网络波动 / 网关超时
             for ($attempt = 1; $attempt -le 3; $attempt++) {
                 try {
-                    $releases = Invoke-RestMethod -Uri $uri -Headers $headers -TimeoutSec 40
+                    $irmArgs = @{ Uri = $uri; Headers = $headers; TimeoutSec = 40 }
+                    if ($script:ActiveProxy) { $irmArgs["Proxy"] = $script:ActiveProxy }   # 按次传入代理, .NET 管线同样生效
+                    $releases = Invoke-RestMethod @irmArgs
                     $lastErr  = $null
                     break
                 } catch {
@@ -342,7 +456,7 @@ function Invoke-InstallFlow([string]$presetVersion = "") {
                     } catch {}
 
                     foreach ($asset in @($rel.assets)) {
-                        if ($sampleNames.Count -lt 3 -and $asset.name -like "*.tar.gz") { $sampleNames += $asset.name }
+                        if ($script:SampleNames.Count -lt 3 -and $asset.name -like "*.tar.gz") { $script:SampleNames += $asset.name }
                         if ($asset.name -notmatch $namePattern) { continue }
 
                         $pyVerStr = $null
@@ -375,12 +489,102 @@ function Invoke-InstallFlow([string]$presetVersion = "") {
         }
 
         if ($repoFailed) {
-            $networkErrors += "${slug}: $lastErr"
+            $script:NetworkErrors += "${slug}: $lastErr"
             Write-Host "仓库 $slug 查询失败。" -ForegroundColor Yellow
         } else {
-            $anyRepoOk = $true
+            $script:AnyRepoOk = $true
         }
         if ($candidates.Count -gt 0) { break }
+    }
+    return $candidates
+}
+
+# ====== 完整性校验与缓存治理 ======
+
+# SHA256 完整性校验: SHA256SUMS 有对应清单项时强制校验; 清单不可得时放行 (部署自检仍会兜底)。
+# 返回 $true = 通过 (或无法校验); $false = 校验失败 (坏包已删除, 调用方可回退下一候选)
+function Test-ArchiveSha256([string]$archiveFilePath, [object]$cand) {
+    $sumsFile = Get-SumsFile $cand.Tag
+    if (-not $sumsFile) {
+        Write-Host "[提示] 未能获取 SHA256SUMS, 跳过完整性校验 (部署自检仍会执行)。" -ForegroundColor DarkYellow
+        return $true
+    }
+    $expected = $null
+    foreach ($line in @(Get-Content $sumsFile -ErrorAction SilentlyContinue)) {
+        if ($line -match '^([0-9a-fA-F]{64})\s+\*?(.+)$') {
+            if ($Matches[2].Trim() -eq $cand.Name) { $expected = $Matches[1].ToLower(); break }
+        }
+    }
+    if (-not $expected) { return $true }   # 清单中无此项, 放行
+    $actual = (Get-FileHash -Path $archiveFilePath -Algorithm SHA256).Hash.ToLower()
+    if ($actual -ne $expected) {
+        Write-Host "[警告] SHA256 校验失败: $($cand.Name)" -ForegroundColor Red
+        Write-Host "  期望: $expected" -ForegroundColor Red
+        Write-Host "  实际: $actual" -ForegroundColor Red
+        Remove-Item $archiveFilePath -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+    Write-Host "SHA256 校验通过" -ForegroundColor Green
+    return $true
+}
+
+# 缓存治理: 部署成功后清理同精确版本的旧日期缓存包 (仅保留本次使用的最新包)
+function Remove-StaleCaches([string]$pyFullVer, [string]$keepName) {
+    $filter = "cpython-$pyFullVer+*-$TargetArch"
+    Get-ChildItem -Path $PSScriptRoot -Filter $filter -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ne $keepName } |
+        ForEach-Object {
+            Write-Host "清理同版本旧日期缓存: $($_.Name)" -ForegroundColor DarkYellow
+            Remove-Item -Path $_.FullName -Force -ErrorAction SilentlyContinue
+        }
+}
+
+# ============ 功能 1 内部: 在线部署执行体 (供统一部署流程调用) ============
+
+# 在线部署执行体: 代理检测 -> 选版本 -> 查询 GitHub -> 下载/缓存 -> 部署。
+# 返回 $true = 版本已部署 (或保留现有安装); $false = 未完成部署 (统一部署流程可据此降级本地)
+function Invoke-InstallFlow([string]$presetVersion = "") {
+    # ---------- 1. 下载代理解析 (局域网代理优先 -> 系统代理 -> 直连) ----------
+    Write-Banner "1. 正在解析下载代理..."
+    Set-DownloadProxy
+    Write-Host ""
+
+    # ---------- 2. 选择 Python 版本 ----------
+    Write-Banner "2. 选择 Python 版本"
+    Write-Host "提示:"
+    Write-Host "  - 输入 大版本.小版本 (如 3.12)   -> 自动选择 3.12.x 中补丁号最高、构建日期最新的包"
+    Write-Host "  - 输入 完整版本号 (如 3.12.13)  -> 下载 3.12.13 中构建日期最新的包"
+    Write-Host "  - 直接回车                     -> 默认使用 $DefaultVersion"
+    Write-Host ""
+
+    $inputVer = $null
+    # 支持从其他流程 (如离线部署失败转在线) 预置版本号, 跳过手动输入
+    if ($presetVersion -match '^[0-9]+\.[0-9]+(\.[0-9]+)?$') {
+        $inputVer = $presetVersion
+        Write-Host "使用指定版本: $inputVer" -ForegroundColor Cyan
+    }
+    while ($null -eq $inputVer) {
+        $inputVer = Read-Input "请输入 Python 版本 [默认: $DefaultVersion]"
+        if ($null -eq $inputVer) {
+            Write-Host "输入已结束, 返回主菜单。" -ForegroundColor Yellow
+            return $false
+        }
+        if ([string]::IsNullOrWhiteSpace($inputVer)) { $inputVer = $DefaultVersion }
+        if ($inputVer -match '^[0-9]+\.[0-9]+(\.[0-9]+)?$') { break }
+        Write-Host "版本号格式无效: [$inputVer], 请输入类似 3.12 或 3.12.13 的格式。" -ForegroundColor Red
+        $inputVer = $null
+    }
+    Write-Host ""
+
+    # ---------- 3. 查询上游构建 (零 API 优先, GitHub API 回退) ----------
+    Write-Banner "3. 正在查询上游构建 [$inputVer] ..."
+
+    $candidates = @(Get-UpstreamCandidatesLight $inputVer)
+    if ($candidates.Count -gt 0) {
+        Write-Host "轻量发现命中 $($candidates.Count) 个候选构建 (零 API, 不受限流影响)。" -ForegroundColor Green
+    } else {
+        Write-Host "轻量发现无结果, 回退 GitHub API 查询..." -ForegroundColor Yellow
+        $candidates = @(Get-UpstreamCandidatesViaApi $inputVer)
     }
 
     $bestMatch = $candidates |
@@ -389,15 +593,15 @@ function Invoke-InstallFlow([string]$presetVersion = "") {
 
     if (-not $bestMatch) {
         Write-Host ""
-        if (-not $anyRepoOk) {
-            Write-Host "[错误] 查询 GitHub API 失败 (已自动重试):" -ForegroundColor Red
-            $networkErrors | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
-            Write-Host "可能原因: 网络不稳定 / 代理未生效 / GitHub API 限流 (未认证每小时 60 次)。" -ForegroundColor Yellow
+        if (-not $script:AnyRepoOk) {
+            Write-Host "[错误] 上游检索失败 (轻量 + API 均未成功):" -ForegroundColor Red
+            $script:NetworkErrors | ForEach-Object { Write-Host "  - $_" -ForegroundColor Red }
+            Write-Host "可能原因: 网络不稳定 / 代理未生效。" -ForegroundColor Yellow
         } else {
             Write-Host "[错误] 仓库中未找到匹配 [$inputVer] 且后缀为 [$TargetArch] 的资源。" -ForegroundColor Red
-            if ($sampleNames.Count -gt 0) {
+            if ($script:SampleNames.Count -gt 0) {
                 Write-Host "源中部分 .tar.gz 资源名示例:" -ForegroundColor Yellow
-                $sampleNames | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
+                $script:SampleNames | ForEach-Object { Write-Host "  - $_" -ForegroundColor Yellow }
             } else {
                 Write-Host "未获取到任何 .tar.gz 资源, 请检查网络后重试。" -ForegroundColor Yellow
             }
@@ -417,12 +621,12 @@ function Invoke-InstallFlow([string]$presetVersion = "") {
 
     $archiveFilePath = Invoke-AssetDownload $bestMatch.Name $bestMatch.Url
     if (-not $archiveFilePath) {
-        Write-Host "[错误] 所有线路均下载失败, 请检查网络/代理后重试。" -ForegroundColor Red
-        return $false
+        # 首选构建获取失败不再直接中止, 交由候选队列尝试次新构建
+        Write-Host "[警告] 首选构建获取失败, 将尝试次新候选构建..." -ForegroundColor Yellow
     }
     Write-Host ""
 
-    # ---------- 5. 部署 (先自检后安装, 缺陷构建自动回退) ----------
+    # ---------- 5. 部署 (SHA256 校验 + 解压自检, 缺陷构建自动回退) ----------
     Write-Banner "5. 部署 Python"
     Write-Host "将安装: $($bestMatch.Name)"
 
@@ -453,6 +657,9 @@ function Invoke-InstallFlow([string]$presetVersion = "") {
                 continue
             }
         }
+        if ($null -eq $archiveFilePath) { continue }
+        # SHA256 完整性校验 (坏包自动删除, 回退下一候选)
+        if (-not (Test-ArchiveSha256 $archiveFilePath $cand)) { continue }
         if (Invoke-DeployPipeline $archiveFilePath $destDir) { $installedName = $cand.Name; break }
     }
 
@@ -462,6 +669,10 @@ function Invoke-InstallFlow([string]$presetVersion = "") {
     }
     if ($installedName -ne $bestMatch.Name) {
         Write-Host "[提示] 最新构建 $($bestMatch.Name) 未通过自检, 已自动回退安装: $($installedName)" -ForegroundColor Yellow
+    }
+    # 缓存治理: 清理同版本旧日期缓存包, 仅保留本次使用的最新包
+    if ($installedName -match '^c?python-([0-9]+\.[0-9]+\.[0-9]+)\+') {
+        Remove-StaleCaches $Matches[1] $installedName
     }
     Write-Host ""
     return $true
@@ -507,15 +718,31 @@ function Get-InstallDestDir([string]$pyTagInput) {
             continue
         }
 
+        # 目标位置可达性检查: 本地盘符必须已挂载 / UNC 共享前两级必须可达
+        # (提前拦截, 避免解压自检全部通过后才在移动阶段失败)
+        $checkRoot = $null
+        if ($destDir -match '^([A-Za-z]:)')            { $checkRoot = $Matches[1] + "\" }
+        elseif ($destDir -match '^\\\\[^\\]+\\[^\\]+') { $checkRoot = $Matches[0] }
+        if ($checkRoot -and -not (Test-Path -LiteralPath $checkRoot)) {
+            Write-Host "目标位置不可达 (磁盘不存在或共享不可用): $checkRoot, 请重新输入。" -ForegroundColor Red
+            continue
+        }
+
+        # 拒绝盘根 / 裸盘符 / UNC 共享根作为安装目录 (覆盖模式会清空整个目标, 防灾难性误删)
+        if ($destDir -match '^[A-Za-z]:$' -or $destDir -match '^\\\\[^\\]+\\[^\\]+$') {
+            Write-Host "不能把安装目录设在根目录: [$destDir], 请指定一个子目录 (如 ${destDir}\Python\python$pyTagInput)。" -ForegroundColor Red
+            continue
+        }
+
         if (Test-Path $destDir) {
             Write-Host ""
             Write-Host "目标目录已存在: $destDir" -ForegroundColor Yellow
-            Write-Host "  [O] 覆盖安装 (清理后全新安装, pip 已装的第三方包不保留) [默认]"
-            Write-Host "  [K] 保留现有安装, 跳过部署"
+            Write-Host "  [O] 覆盖安装 (清理后全新安装, pip 已装的第三方包不保留)"
+            Write-Host "  [K] 保留现有安装, 跳过部署 [默认]"
             Write-Host "  [N] 更换安装目录"
             $act = Read-Input "请选择"
             if ($null -eq $act) { return $null }
-            if ([string]::IsNullOrWhiteSpace($act)) { $act = "O" }
+            if ([string]::IsNullOrWhiteSpace($act)) { $act = "K" }
             $act = $act.Substring(0, 1).ToUpper()
             if ($act -eq "K") { return @{ Dir = $destDir; Skip = $true } }
             if ($act -eq "N") { continue }   # 重新输入目录
@@ -528,6 +755,10 @@ function Get-InstallDestDir([string]$pyTagInput) {
 # 部署管线 (本地 / 在线统一使用): 解压自检 -> 整体替换 -> pip 脚本 -> 注册表/PATH -> 完成汇总。
 # 返回 $true = 部署成功; $false = 解压/自检失败 (已清理现场, 调用方可换下一个包重试)
 function Invoke-DeployPipeline([string]$archiveFilePath, [string]$destDir) {
+    # 临时文件自动清理: 先清掉历史遗留的临时解压目录 (上次运行异常中断时可能残留)
+    Get-ChildItem -Path $ExtractParentDir -Filter ".py_deploy_*" -Directory -Force -ErrorAction SilentlyContinue |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
     # 解压到临时目录 (不直接覆盖旧目录, 自检通过后再整体替换)
     $tempExtract = Join-Path $ExtractParentDir (".py_deploy_" + [guid]::NewGuid().ToString("N").Substring(0, 8))
     New-Item -ItemType Directory -Path $tempExtract -Force | Out-Null
@@ -557,14 +788,14 @@ function Invoke-DeployPipeline([string]$archiveFilePath, [string]$destDir) {
         $prevEap = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
         try {
-            $healthOut  = (& $tmpPyExe -c "import glob, pathlib; print('HEALTH_OK')" 2>&1 | Out-String)
+            $healthOut  = (& $tmpPyExe -c "import glob, pathlib, pip; print('HEALTH_OK')" 2>&1 | Out-String)
             $healthCode = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $prevEap
         }
 
         if ($healthCode -ne 0 -or $healthOut -notmatch 'HEALTH_OK' -or $healthOut -match 'Error in sitecustomize' -or $healthOut -match 'ImportError') {
-            throw "构建自检未通过 (标准库导入异常), 该构建可能存在缺陷。"
+            throw "构建自检未通过 (标准库/pip 导入异常), 该构建可能存在缺陷。"
         }
         Write-Host "构建自检通过!" -ForegroundColor Green
     } catch {
@@ -583,6 +814,14 @@ function Invoke-DeployPipeline([string]$archiveFilePath, [string]$destDir) {
             Write-Host "正在停止占用该目录的 Python 进程 (PID: $($_.Id))..." -ForegroundColor Yellow
             Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue
         }
+
+    # 目标目录的父级链逐层创建 (New-Item -Force 递归补齐缺失层级;
+    # Move-Item 本身不会创建缺失的父级目录, 不补齐会部署失败)
+    $destParent = Split-Path -Path $destDir -Parent
+    if ($destParent -and -not (Test-Path -LiteralPath $destParent)) {
+        Write-Host "安装目录不存在, 正在逐层创建: $destParent ..."
+        New-Item -ItemType Directory -Path $destParent -Force | Out-Null
+    }
 
     if (Test-Path $destDir) {
         Write-Host "正在清理旧安装 (覆盖模式) ..."
@@ -845,6 +1084,10 @@ function Invoke-LocalDeploy([object]$best, [object[]]$queue, [string]$pyTagInput
     if ($installedName -ne $best.Name) {
         Write-Host "[提示] 最新离线包 $($best.Name) 未通过自检, 已自动回退安装: $($installedName)" -ForegroundColor Yellow
     }
+    # 缓存治理: 清理同精确版本的旧日期离线包, 仅保留本次使用的最新包
+    if ($installedName -match '^c?python-([0-9]+\.[0-9]+\.[0-9]+)\+') {
+        Remove-StaleCaches $Matches[1] $installedName
+    }
     Write-Host ""
     return $true
 }
@@ -856,7 +1099,7 @@ function Invoke-LocalDeploy([object]$best, [object[]]$queue, [string]$pyTagInput
 #   大版本 (如 3.12)       -> 在线优先获取最新构建 (本地缓存命中免下载), 失败降级本地
 #   o [版本] (如 o 3.13)   -> 强制在线 (忽略本地包); 裸 o 等价 o 3.12
 #   直接回车               -> 等价输入大版本 $DefaultVersion
-function Invoke-DeployFlow {
+function Invoke-DeployFlow([string]$PresetVersion = "") {
     Write-Banner "部署 Python (离线包优先, 支持在线)"
     Write-Host "本功能将:"
     Write-Host "  - 自动扫描脚本目录内所有 *-x86_64-pc-windows-msvc-install_only.tar.gz 离线包并罗列"
@@ -870,8 +1113,7 @@ function Invoke-DeployFlow {
         Write-Host "[提示] 脚本目录未发现任何离线压缩包, 将直接进入在线模式。" -ForegroundColor Yellow
         Write-Host "  (在线下载的压缩包会保留在脚本目录, 下次即可作为离线包复用)" -ForegroundColor Yellow
         Write-Host ""
-        Invoke-InstallFlow
-        return
+        return (Invoke-InstallFlow)
     }
 
     # 罗列本地可选包 (已按版本降序, 同版本多日期仅保留最新)
@@ -881,18 +1123,22 @@ function Invoke-DeployFlow {
         Write-Host ("  [{0}] {1}  ({2}, 约 {3} MB)" -f ($i + 1), $a.Name, $a.DateStr, [math]::Round((Get-Item $a.Path).Length / 1MB, 1))
     }
     Write-Host ""
-    Write-Host "输入说明:" -ForegroundColor White
-    Write-Host "  - 编号 (如 1)           -> 使用对应离线包部署 (强制本地)"
-    Write-Host "  - 完整版本 (如 3.12.16) -> 优先使用本地同版本包, 本地没有则在线查找"
-    Write-Host "  - 大版本 (如 3.12)      -> 在线获取该系列最新构建 (本地命中缓存则免下载), 失败自动降级本地"
-    Write-Host "  - o [版本] (如 o 3.13)  -> 强制在线 (忽略本地包)"
-    Write-Host "  - 直接回车              -> 等价输入 $DefaultVersion"
-    Write-Host ""
-
-    $pick = Read-Input "请输入编号 / 版本号 / o [版本] (直接回车 = $DefaultVersion)"
+    if ([string]::IsNullOrWhiteSpace($PresetVersion)) {
+        Write-Host "输入说明:" -ForegroundColor White
+        Write-Host "  - 编号 (如 1)           -> 使用对应离线包部署 (强制本地)"
+        Write-Host "  - 完整版本 (如 3.12.16) -> 优先使用本地同版本包, 本地没有则在线查找"
+        Write-Host "  - 大版本 (如 3.12)      -> 在线获取该系列最新构建 (本地命中缓存则免下载), 失败自动降级本地"
+        Write-Host "  - o [版本] (如 o 3.13)  -> 强制在线 (忽略本地包)"
+        Write-Host "  - 直接回车              -> 等价输入 $DefaultVersion"
+        Write-Host ""
+        $pick = Read-Input "请输入编号 / 版本号 / o [版本] (直接回车 = $DefaultVersion)"
+    } else {
+        Write-Host "启动参数指定版本: $PresetVersion" -ForegroundColor Cyan
+        $pick = $PresetVersion
+    }
     if ($null -eq $pick) {
-        Write-Host "输入已结束, 返回主菜单。" -ForegroundColor Yellow
-        return
+        Write-Host "输入已结束, 部署未完成。" -ForegroundColor Yellow
+        return $false
     }
     if ([string]::IsNullOrWhiteSpace($pick)) { $pick = $DefaultVersion }
 
@@ -901,11 +1147,11 @@ function Invoke-DeployFlow {
         $idx = 0
         if (-not [int]::TryParse($pick, [ref]$idx)) {
             Write-Host "编号无效: [$pick]" -ForegroundColor Red
-            return
+            return $false
         }
         if ($idx -lt 1 -or $idx -gt $archives.Count) {
             Write-Host "编号超出范围: [$pick], 请输入 1-$($archives.Count)。" -ForegroundColor Red
-            return
+            return $false
         }
         $best       = $archives[$idx - 1]
         $pyTagInput = "$($best.PyVer.Major).$($best.PyVer.Minor)"
@@ -913,31 +1159,31 @@ function Invoke-DeployFlow {
         $queue = @($best) + @($archives |
             Where-Object { $_.Name -ne $best.Name -and $_.PyVer.ToString().StartsWith("$pyTagInput.") } |
             Select-Object -First 2)
-        if ((Invoke-LocalDeploy $best $queue $pyTagInput) -eq $false) {
+        $ok = Invoke-LocalDeploy $best $queue $pyTagInput
+        if (-not $ok) {
             # 坏包已被部署管线删除; 转在线可从 GitHub 获取更多历史构建, 绕过缺陷构建
             if ((Read-YesNo "是否转在线方式重新下载安装 $pyTagInput (需要网络)" "Y") -eq "Y") {
                 Write-Host ""
-                Invoke-InstallFlow $pyTagInput
+                $ok = Invoke-InstallFlow $pyTagInput
             }
         }
-        return
+        return $ok
     }
 
     # ---- 输入 2: o [版本] -> 强制在线 ----
     if ($pick -match '^(?i:o)(\s+([0-9]+\.[0-9]+(\.[0-9]+)?))?\s*$') {
         $oVer = $Matches[2]
         if ([string]::IsNullOrEmpty($oVer)) {
-            Invoke-InstallFlow $DefaultVersion        # 裸 o -> 强制在线, 默认大版本
+            return (Invoke-InstallFlow $DefaultVersion)   # 裸 o -> 强制在线, 默认大版本
         } else {
-            Invoke-InstallFlow $oVer                  # o 3.13 / o 3.13.18
+            return (Invoke-InstallFlow $oVer)             # o 3.13 / o 3.13.18
         }
-        return
     }
 
     # ---- 输入 3: 版本号 ----
     if ($pick -notmatch '^[0-9]+\.[0-9]+(\.[0-9]+)?$') {
         Write-Host "无效输入: [$pick] (应为编号 / 版本号 / o [版本])。" -ForegroundColor Red
-        return
+        return $false
     }
     $pyTagInput = $pick
     if ($pick -match '^([0-9]+\.[0-9]+)') { $pyTagInput = $Matches[1] }
@@ -949,25 +1195,26 @@ function Invoke-DeployFlow {
         if ($matched.Count -gt 0) {
             $best  = $matched[0]   # $archives 已按 版本/日期 降序, 匹配结果天然有序
             $queue = @($matched | Select-Object -First 3)
-            if ((Invoke-LocalDeploy $best $queue $pyTagInput) -eq $false) {
+            $ok = Invoke-LocalDeploy $best $queue $pyTagInput
+            if (-not $ok) {
                 if ((Read-YesNo "是否转在线方式重新下载安装 $pyTagInput (需要网络)" "Y") -eq "Y") {
                     Write-Host ""
-                    Invoke-InstallFlow $pyTagInput
+                    $ok = Invoke-InstallFlow $pyTagInput
                 }
             }
+            return $ok
         } else {
             Write-Host "[提示] 本地没有精确版本 [$pick] 的离线包, 转在线查找。" -ForegroundColor Yellow
             Write-Host ""
-            Invoke-InstallFlow $pick
+            return (Invoke-InstallFlow $pick)
         }
-        return
     }
 
     # ---- 大版本 (如 3.12): 在线优先 (最新构建, 本地缓存命中则免下载), 失败降级本地 ----
     Write-Host ""
     Write-Host "大版本 [$pick]: 优先在线获取该系列最新构建 (本地已有相同压缩包时免下载)..." -ForegroundColor Cyan
     Write-Host ""
-    if (Invoke-InstallFlow $pick) { return }
+    if (Invoke-InstallFlow $pick) { return $true }
 
     Write-Host ""
     Write-Host "在线部署未完成, 自动降级: 尝试本地离线包 [$pick.x] ..." -ForegroundColor Yellow
@@ -977,12 +1224,12 @@ function Invoke-DeployFlow {
         $avail = @()
         foreach ($a in $archives) { if ($avail -notcontains $a.PyVer.ToString()) { $avail += $a.PyVer.ToString() } }
         Write-Host "  当前可用的离线包版本: $($avail -join ', ')" -ForegroundColor Yellow
-        return
+        return $false
     }
     $best  = $matched[0]
     $queue = @($matched | Select-Object -First 3)
-    Invoke-LocalDeploy $best $queue $pyTagInput | Out-Null
     # 注: 此分支在线已失败过, 不再重复提示转在线
+    return (Invoke-LocalDeploy $best $queue $pyTagInput)
 }
 
 # ============== 清理/卸载共用: 识别与执行 ==============
@@ -1333,6 +1580,13 @@ function Invoke-CleanOrUninstallFlow {
     if (-not (Show-CleanupPlan $plan $inputVer)) { return }
 
     $dirs     = @($plan.Matched | Where-Object { $_.InstallPath } | ForEach-Object { $_.InstallPath } | Select-Object -Unique)
+    # 防灾难性误删: 根目录形态的 InstallPath (盘根 "D:" / UNC 共享根) 绝不进入文件删除清单
+    # (仅在注册表 InstallPath 被外部改坏时可能出现; 注册表/关联/PATH 照常处理)
+    $rootLike = @($dirs | Where-Object { $_ -match '^[A-Za-z]:$' -or $_ -match '^\\\\[^\\]+\\[^\\]+$' })
+    $dirs     = @($dirs | Where-Object { $rootLike -inotcontains $_ })
+    foreach ($rl in $rootLike) {
+        Write-Host "[安全拦截] 注册表 InstallPath 指向根目录 ($rl), 已从文件删除清单排除。" -ForegroundColor Red
+    }
     # 共享目录保护同样适用于文件删除: 被其他未清理版本引用的目录绝不删除 (否则会连带删掉别的版本)
     $existing = @($dirs | Where-Object { (Test-Path $_) -and ($plan.SharedOverlap -inotcontains $_) })
     $sharedDirs = @($dirs | Where-Object { (Test-Path $_) -and ($plan.SharedOverlap -icontains $_) })
@@ -1420,6 +1674,7 @@ function Invoke-CleanOrUninstallFlow {
 
 # 切换主用版本: 目标版本的 PATH 条目在 Machine/User 两层中置前, .py/.pyc/.pyw 关联改指向该版本
 function Invoke-SwitchDefaultVersion($r) {
+    $IsAdmin = Test-IsAdmin   # 管理员需同时写系统级关联 (HKCR), 此前误用未定义变量导致恒走用户级分支
     $destDir = $r.InstallPath.TrimEnd("\")
     $pyExe   = Join-Path $destDir "python.exe"
     $pywExe  = Join-Path $destDir "pythonw.exe"
@@ -1490,6 +1745,47 @@ function Invoke-SwitchDefaultVersion($r) {
     Invoke-EnvBroadcast
 }
 
+# 识别当前主用版本: 信号1 = .py 文件关联指向的 python.exe (双击 .py 实际使用的解释器);
+# 信号2 = PATH 中首个 Python 条目 (命令行 python 的实际来源, Machine 层在前 User 层在后)。
+# 返回匹配的 Tag; 无法判定返回 ""
+function Get-CurrentPrimaryTag([object[]]$usable) {
+    if ($usable.Count -eq 0) { return "" }
+    $primaryTag = ""
+
+    # 信号 1: .py 文件关联 (Python.File\shell\open\command)
+    $cmd = ""
+    try {
+        $cmd = [string](Get-Item -Path "Registry::HKEY_CLASSES_ROOT\Python.File\shell\open\command" -ErrorAction Stop).GetValue("")
+    } catch { }
+    if ($cmd) {
+        $exe = $null
+        if ($cmd -match '^"([^"]+)"')     { $exe = $Matches[1] }
+        elseif ($cmd -match '^([^\s"]+)') { $exe = $Matches[1] }
+        if ($exe -and (Test-Path $exe)) {
+            $assocDir = (Split-Path -Path $exe -Parent).TrimEnd("\")
+            foreach ($r in $usable) {
+                if ($r.InstallPath -and ($assocDir -ieq $r.InstallPath.TrimEnd("\"))) { $primaryTag = $r.Tag; break }
+            }
+        }
+    }
+
+    # 信号 2: PATH 首个 Python 相关条目
+    if (-not $primaryTag) {
+        foreach ($scope in @("Machine", "User")) {
+            $entries = @([Environment]::GetEnvironmentVariable("Path", $scope) -split ";" |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            foreach ($e in $entries) {
+                foreach ($r in $usable) {
+                    if ($r.InstallPath -and (Test-PathUnder $e $r.InstallPath)) { $primaryTag = $r.Tag; break }
+                }
+                if ($primaryTag) { break }
+            }
+            if ($primaryTag) { break }
+        }
+    }
+    return $primaryTag
+}
+
 function Invoke-ShowFlow {
     Write-Banner "查看本机已注册的 Python 版本"
     Show-RegisteredPythons
@@ -1501,11 +1797,21 @@ function Invoke-ShowFlow {
     }
     if ($usable.Count -ge 2) {
         Write-Host ""
+        $primaryTag = Get-CurrentPrimaryTag $usable
         Write-Host "可切换为主用的版本 (调整 PATH 顺序 + .py 打开方式):" -ForegroundColor White
         for ($i = 0; $i -lt $usable.Count; $i++) {
-            Write-Host ("  [{0}] {1,-8} {2}" -f ($i + 1), $usable[$i].Tag, $usable[$i].InstallPath)
+            if ($usable[$i].Tag -eq $primaryTag) {
+                # 当前主用: *** 前缀 + 绿色标注 ("*** " + 4位tag 恰好与 8 列 tag 对齐)
+                Write-Host ("  [{0}] " -f ($i + 1)) -NoNewline
+                Write-Host ("*** {0,-4} {1}" -f $usable[$i].Tag, $usable[$i].InstallPath) -ForegroundColor Green -NoNewline
+                Write-Host "  (当前主用)" -ForegroundColor Green
+            } else {
+                Write-Host ("  [{0}] {1,-8} {2}" -f ($i + 1), $usable[$i].Tag, $usable[$i].InstallPath)
+            }
         }
-        $pick = Read-Input "输入编号将对应版本设为主用 (直接回车跳过)"
+        $prompt = "输入编号将对应版本设为主用 (直接回车跳过)"
+        if ($primaryTag) { $prompt = "输入编号将对应版本设为主用 (当前主用: $primaryTag, 直接回车跳过)" }
+        $pick = Read-Input $prompt
         if ($null -eq $pick) { return }   # EOF
         if (-not [string]::IsNullOrWhiteSpace($pick)) {
             $idx = 0
@@ -1542,7 +1848,7 @@ function Show-MainMenu {
     Write-Host ""
     Write-Host "  ======================================================" -ForegroundColor Cyan
     Write-Host "    PyVersions  " -ForegroundColor Cyan -NoNewline
-    Write-Host "v1.6.0" -ForegroundColor Yellow
+    Write-Host "v1.8.0" -ForegroundColor Yellow
     Write-Host "    Python 独立版 (install_only) 管理工具" -ForegroundColor DarkGray
     Write-Host "  ======================================================" -ForegroundColor Cyan
     Write-Host "  当前权限: " -NoNewline
@@ -1583,6 +1889,34 @@ function Show-MainMenu {
     Write-Host ""
 }
 
+# ----------------------- 启动参数模式 -----------------------
+# PyVersions.ps1 [-h|--help] 显示用法; PyVersions.ps1 3.12 / 3.12.16 直接部署 (退出码: 0 成功 / 1 失败)
+if ($Help -or $InputVersion -match '^(?i:-{1,2}h(e(lp)?)?|/\?|-\?)\s*$') {
+    Write-Host ""
+    Write-Host "PyVersions.ps1  -  Python 独立版 (install_only) 多版本管理工具" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host "用法:" -ForegroundColor White
+    Write-Host "  PyVersions.ps1              进入交互主菜单"
+    Write-Host "  PyVersions.ps1 3.12         直接部署 3.12 系列 (大版本语义: 在线优先, 失败降级本地离线包)"
+    Write-Host "  PyVersions.ps1 3.12.16      直接部署精确版本 (本地优先, 本地无则在线)"
+    Write-Host "  PyVersions.ps1 -h|--help    显示本帮助"
+    Write-Host ""
+    Write-Host "交互模式输入: 编号 = 强制本地离线包 | o [版本] = 强制在线 | 直接回车 = $DefaultVersion"
+    Write-Host "退出码: 0 = 部署成功, 1 = 部署失败或参数无效"
+    Write-Host ""
+    exit 0
+}
+
+if (-not [string]::IsNullOrWhiteSpace($InputVersion)) {
+    if ($InputVersion -notmatch '^[0-9]+\.[0-9]+(\.[0-9]+)?$') {
+        Write-Host "[错误] 无效的启动参数: [$InputVersion] (应为版本号, 如 3.12 / 3.12.16; 用 -h 查看帮助)。" -ForegroundColor Red
+        exit 1
+    }
+    $deployOk = Invoke-DeployFlow $InputVersion
+    if ($deployOk) { exit 0 } else { exit 1 }
+}
+
+# ----------------------- 交互模式 -----------------------
 while ($true) {
     Show-MainMenu
     $choice = Read-Input "请输入选项编号"
@@ -1593,7 +1927,7 @@ while ($true) {
         break
     }
     switch ($choice) {
-        "1" { Invoke-DeployFlow }
+        "1" { $null = Invoke-DeployFlow }
         "2" { Invoke-CleanOrUninstallFlow }
         "3" { Invoke-ShowFlow }
         default { Write-Host "无效选项: [$choice], 请输入 0-3。" -ForegroundColor Red }

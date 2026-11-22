@@ -6,7 +6,7 @@ An interactive PowerShell tool to install, switch, and uninstall **standalone Py
 
 ```
   ======================================================
-    PyVersions  v1.6.0
+    PyVersions  v1.8.0
     Python 独立版 (install_only) 管理工具
   ======================================================
   当前权限: 管理员 (写入系统级注册表 / 系统 PATH)
@@ -20,8 +20,14 @@ An interactive PowerShell tool to install, switch, and uninstall **standalone Py
 ## Features
 
 - **Unified deploy (offline archives + online download in one flow)** — entering deploy lists the offline archives in the script directory and picks the source automatically: a number (`1`) forces the matching archive; an exact version (`3.12.16`) prefers local and falls back to online; a major version (`3.12`) goes **online-first** for the newest build (zero download when the archive is already cached) and degrades to local archives when offline; `o [version]` forces online; with no local archives it goes straight to online mode.
+- **Startup-argument deploy** — `PyVersions.ps1 3.12` / `PyVersions.ps1 3.12.16` deploy directly without the menu (same semantics as the interactive input); `-h` shows help. Exit code `0` on success / `1` on failure — script-friendly. Without arguments it enters the interactive menu.
+- **Zero-API version discovery** — the newest upstream build tags are resolved via the `releases/latest` HTTP 302 redirect plus `releases.atom` (immune to GitHub API rate limits); the GitHub API remains as a fallback covering old majors the atom feed may miss. Each tag's `SHA256SUMS` manifest (tens of KB) then yields the exact asset candidates.
+- **SHA256 integrity check** — every downloaded archive is verified against the upstream `SHA256SUMS` manifest; a bad archive is deleted and the next-newest candidate takes over. Manifests are cached per release tag (`SHA256SUMS-<tag>`) in the script directory.
+- **Cache governance** — after a successful deploy, older-date cached archives of the same exact version are pruned (only the one just used is kept); leftover temp extract dirs (`.py_deploy_*`) from crashed runs are swept automatically at the start of every deploy.
+- **LAN proxy acceleration** — before downloads, a list of LAN proxy candidates (200 ms TCP probe each) is tried first; the first reachable one is used as the download proxy. Falls back to the system proxy, then direct connection. Behavior is identical to the Linux sibling `PyVersions_pyenv.sh`.
 - **Resilient download** — automatic mirror fallback when GitHub direct fails (`ghfast.top`, `gh-proxy.com`); archives downloaded online are kept in the script directory and automatically become offline candidates next time (cache loop).
-- **Integrity self-check with fallback** — every build is extracted to a temp dir and health-checked (`import glob, pathlib`) *before* touching your installation; a defective build automatically falls back to the next-newest candidate. The whole install directory is replaced atomically — no mixed old/new stdlib.
+- **Integrity self-check with fallback** — every build is extracted to a temp dir and health-checked (`import glob, pathlib, pip`) *before* touching your installation; a defective build automatically falls back to the next-newest candidate. The whole install directory is replaced atomically — no mixed old/new stdlib.
+- **Idempotent deploy** — when the target directory already exists, **keep the existing install** is the default (just press Enter); overwrite or relocating requires explicit confirmation, so re-running never wipes your third-party packages by accident.
 - **Full environment integration** — PEP 514 registry entries (`HKLM`/`HKCU` with automatic privilege-based fallback), `.py`/`.pyc`/`.pyw` file associations, PATH setup (deduplicated, prepended), and a `WM_SETTINGCHANGE` broadcast so new terminals work immediately.
 - **Multi-version coexistence** — each version lives in its own directory (e.g. `D:\Python\python3.12`, `D:\Python\python3.13`). Version-pinned `pip3.12.bat` / `pip3.13.bat` launchers in each `Scripts` folder make `pip` unambiguous.
 - **Safe uninstall** — removes the registry keys, file associations, and PATH entries for a chosen version, optionally the install directory too (with a type-the-version confirmation). Orphaned PATH entries are detected even without registry references.
@@ -44,13 +50,27 @@ Older Windows versions are not supported (they lack built-in `curl.exe`).
 
 ```powershell
 # 1. Save PyVersions.ps1 anywhere (e.g. D:\Tools)
-# 2. Run it:
+# 2. Interactive menu:
 powershell.exe -ExecutionPolicy Bypass -File PyVersions.ps1
+# 3. Or deploy a version directly:
+powershell.exe -ExecutionPolicy Bypass -File PyVersions.ps1 3.12
+powershell.exe -ExecutionPolicy Bypass -File PyVersions.ps1 3.12.16
 ```
 
 Recommended: right-click the script → *Run with PowerShell*, or create a shortcut with the command above. Admin rights are optional — as admin it writes system-level registry/PATH (HKLM/HKCR); as a normal user it gracefully falls back to per-user locations (HKCU / user PATH).
 
 ## Usage
+
+### Startup-argument mode
+
+| Command | Meaning |
+|---|---|
+| `PyVersions.ps1` | Enter the interactive main menu |
+| `PyVersions.ps1 3.12` | Deploy the newest 3.12 series build directly (major-version semantics: online-first, degrade to local) |
+| `PyVersions.ps1 3.12.16` | Deploy that exact version directly (local first, online if missing) |
+| `PyVersions.ps1 -h` / `--help` | Show help |
+
+Exit codes in argument mode: `0` deploy succeeded (or existing install kept), `1` deploy failed or invalid argument. Confirmation prompts (install dir / overwrite / registry import) remain interactive; EOF on stdin takes the safe defaults (keep existing install / skip import).
 
 ### [1] Deploy Python (offline + online, unified)
 
@@ -77,7 +97,7 @@ Two modes are listed for you to choose:
 
 ### [3] View registered versions / switch primary
 
-Lists every registered Python (registry + PATH, both hives). With two or more valid versions you can **set one as primary**: its PATH entries jump to the front and `.py`/`.pyc`/`.pyw` associations point to it.
+Lists every registered Python (registry + PATH, both hives). With two or more valid versions you can **set one as primary**: its PATH entries jump to the front and `.py`/`.pyc`/`.pyw` associations point to it. The current primary version is highlighted with a green `***` marker.
 
 ### Install locations
 
@@ -89,7 +109,11 @@ Three built-in choices at install time (or type any custom path):
 | 2 | `%ProgramFiles%\Python<XY>` (resolved via `%ProgramW6432%` in the script) | Official-installer convention, All Users (needs admin) |
 | 3 | `%LocalAppData%\Programs\Python\Python<XY>` | Official-installer convention, current user |
 
-`<XY>` is the version without the dot, e.g. `Python312`.
+`<XY>` is the version without the dot, e.g. `Python312`. Missing parent folders of a custom path are created automatically (level by level); unreachable drives / network shares are rejected immediately at selection time; the install directory cannot be a drive or share root. When the target directory exists you choose **overwrite / keep existing (default) / relocate** — pressing Enter keeps the existing install, so idempotent re-runs never wipe third-party packages by accident.
+
+### LAN proxy acceleration
+
+The script ships a `$GlobalProxyUrls` list of LAN proxy candidates (e.g. `http://localhost:56666`). Before every deploy each candidate gets a 200 ms TCP probe; the first reachable one is passed **per-invocation** to the download commands (`curl -x` / `-Proxy`) — **system proxy settings and proxy environment variables are never modified**. Pre-set `http_proxy`/`https_proxy` are used as-is; otherwise it falls back to the system proxy, then direct. Edit the config block to match your intranet.
 
 ### pip launchers
 
@@ -111,7 +135,7 @@ Each deployment creates in its `Scripts` folder:
 
 ## How it works
 
-- Version discovery uses the GitHub API of [astral-sh/python-build-standalone](https://github.com/astral-sh/python-build-standalone) (assets named `cpython-<ver>+<date>-x86_64-pc-windows-msvc-install_only.tar.gz`).
+- Version discovery targets [astral-sh/python-build-standalone](https://github.com/astral-sh/python-build-standalone) via a zero-API channel first (the `releases/latest` HTTP 302 redirect + `releases.atom` for the 3 newest tags), with the GitHub API as a fallback for old majors the atom feed may miss; each tag's `SHA256SUMS` manifest matches assets named `cpython-<ver>+<date>-x86_64-pc-windows-msvc-install_only.tar.gz` and doubles as the integrity reference.
 - Registry layout follows [PEP 514](https://peps.python.org/pep-0514/) (`PythonCore\<tag>`), which is what tools like `py.exe` and VS Code scan.
 - The health check exists because some 20261110-era builds shipped with a broken `glob`/`pathlib` chain that only surfaces at `pip` runtime — the check catches exactly that class of defect before it reaches your machine.
 - PATH changes are broadcast via `WM_SETTINGCHANGE`; already-open terminals need to be reopened.
