@@ -1,7 +1,7 @@
 #!/bin/bash
 # ==============================================================================
 # 脚本名称: PyVersions_pyenv.sh
-# 版本:     v1.8.0 (与 PyVersions.ps1 同步演进)
+# 版本:     v1.8.3 (与 PyVersions.ps1 同步演进)
 # 适用系统: CentOS 7+, Debian 10+, Ubuntu 18.04+ (支持 x86_64 / aarch64)
 # 功能描述: 免编译一键安装指定版本 Python —— 使用 python-build-standalone
 #           官方预编译包(含 SHA256 完整性校验与标准库/pip 健康自检), 由 pyenv 统一管理,
@@ -92,13 +92,28 @@ TMP_WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pyversions_pyenv.XXXXXX")
 cleanup() { rm -rf "$TMP_WORK_DIR"; }
 trap cleanup EXIT
 
+# ---------- SHA256SUMS 清单缓存目录 ----------
+# 按用户隔离存放于 /tmp (FHS 短命文件位; 重启/系统清理后缓存失效, 重下仅几十 KB 代价可忽略)
+# 失败时回退本次运行的 mktemp 目录 (仍可用, 仅失去跨运行缓存)
+SUMS_DIR="${TMPDIR:-/tmp}/pyversions_sums-$UID"
+if ! mkdir -p "$SUMS_DIR" 2>/dev/null; then
+    SUMS_DIR="$TMP_WORK_DIR"
+fi
+# 迁移清扫: v1.8.1 及之前清单缓存在 pyenv cache 目录, 统一移至 SUMS_DIR
+rm -f "$CACHE_DIR"/SHA256SUMS-* 2>/dev/null || true
+
 # ---------- 下载代理解析 (优先于系统代理, 与 PyVersions.ps1 行为对齐) ----------
 # 结果按次传给 curl (-x) / git (-c http.proxy), 不改写 http_proxy/https_proxy 环境变量,
 # 也不改动任何系统代理配置 (局域网代理只是"拿来用", 不是"替换")
+# 惰性解析: 不在启动时探测, 由 ensure_proxy 在真正触网前调用 (每次部署重新解析一次)
 ACTIVE_PROXY=""
 CURL_PROXY_ARGS=""
 GIT_PROXY_ARGS=""
 setup_proxy() {
+    # 重置上次解析结果 (可在同一会话内多次调用, 始终反映当前网络状况)
+    ACTIVE_PROXY=""
+    CURL_PROXY_ARGS=""
+    GIT_PROXY_ARGS=""
     # 1. 用户预设的代理环境变量: 直接沿用 (优先级最高, 不做任何改动)
     if [ -n "${http_proxy:-}" ] || [ -n "${https_proxy:-}" ] || [ -n "${HTTP_PROXY:-}" ] || [ -n "${HTTPS_PROXY:-}" ]; then
         ACTIVE_PROXY="${http_proxy:-${https_proxy:-${HTTP_PROXY:-${HTTPS_PROXY:-}}}}"
@@ -135,7 +150,12 @@ setup_proxy() {
     echo "局域网代理均不可达, 转用系统代理/直连。"
     return 0
 }
-setup_proxy
+PROXY_READY=0
+ensure_proxy() {
+    [ "$PROXY_READY" -eq 1 ] && return 0
+    setup_proxy
+    PROXY_READY=1
+}
 
 # 多线路轮询下载: download_with_mirrors <原始GitHub_URL> <输出路径>
 download_with_mirrors() {
@@ -215,6 +235,8 @@ query_upstream_candidates() {
     local tags=()
     local latest_tag=""
     local mirror
+    # 注意: 本函数经 < <( ... ) 进程替换调用, stdout 会进入候选管道,
+    # 因此 ensure_proxy (含交互提示) 必须在调用方的主 shell 上下文执行
 
     echo "正在查询上游 GitHub Releases [$target] ..." >&2
 
@@ -268,8 +290,7 @@ query_upstream_candidates() {
     # 3. 逐个检索候选 Tag 的 SHA256SUMS 清单
     local results=""
     for t in "${tags[@]}"; do
-        local sums_cache="$CACHE_DIR/SHA256SUMS-${t}"
-        local sums_tmp="$TMP_WORK_DIR/SHA256SUMS-${t}"
+        local sums_cache="$SUMS_DIR/SHA256SUMS-${t}"
         local sums_file=""
 
         if [ -s "$sums_cache" ]; then
@@ -277,12 +298,12 @@ query_upstream_candidates() {
         else
             local sums_url="https://github.com/astral-sh/python-build-standalone/releases/download/${t}/SHA256SUMS"
             for mirror in "${DOWNLOAD_MIRRORS[@]}"; do
-                if curl $CURL_PROXY_ARGS -fsSL --retry 2 --connect-timeout 12 "${mirror}${sums_url}" -o "${sums_tmp}.part" 2>/dev/null; then
-                    mv "${sums_tmp}.part" "$sums_tmp"
-                    sums_file="$sums_tmp"
+                if curl $CURL_PROXY_ARGS -fsSL --retry 2 --connect-timeout 12 "${mirror}${sums_url}" -o "${sums_cache}.part" 2>/dev/null; then
+                    mv "${sums_cache}.part" "$sums_cache"
+                    sums_file="$sums_cache"
                     break
                 fi
-                rm -f "${sums_tmp}.part"
+                rm -f "${sums_cache}.part"
             done
         fi
 
@@ -432,20 +453,17 @@ deploy_from_queue() {
             continue
         fi
 
-        # SHA256 校验 (优先复用 $TMP_WORK_DIR 或 $CACHE_DIR 中已有的校验文件)
-        SUMS_FILE="$CACHE_DIR/SHA256SUMS-${RELEASE_TAG}"
-        SUMS_PREFETCH="$TMP_WORK_DIR/SHA256SUMS-${RELEASE_TAG}"
-        if [ ! -f "$SUMS_FILE" ] && [ -s "$SUMS_PREFETCH" ]; then
-            cp -f "$SUMS_PREFETCH" "$SUMS_FILE"
-        fi
+        # SHA256 校验: 复用 SUMS_DIR 缓存清单, 缺失时按需下载
+        SUMS_FILE="$SUMS_DIR/SHA256SUMS-${RELEASE_TAG}"
         if [ ! -f "$SUMS_FILE" ]; then
+            ensure_proxy
             SUMS_URL="https://github.com/astral-sh/python-build-standalone/releases/download/${RELEASE_TAG}/SHA256SUMS"
             for mirror in "${DOWNLOAD_MIRRORS[@]}"; do
-                if curl $CURL_PROXY_ARGS -fsSL --retry 2 --connect-timeout 10 "${mirror}${SUMS_URL}" -o "${SUMS_PREFETCH}.part" 2>/dev/null; then
-                    mv "${SUMS_PREFETCH}.part" "$SUMS_FILE"
+                if curl $CURL_PROXY_ARGS -fsSL --retry 2 --connect-timeout 10 "${mirror}${SUMS_URL}" -o "${SUMS_FILE}.part" 2>/dev/null; then
+                    mv "${SUMS_FILE}.part" "$SUMS_FILE"
                     break
                 fi
-                rm -f "${SUMS_PREFETCH}.part"
+                rm -f "${SUMS_FILE}.part"
             done
         fi
 
@@ -507,6 +525,7 @@ deploy_flow() {
     FINAL_VERSION=""
     FINAL_CACHE_FILE=""
     USER_CONFIRMED_REINSTALL=0
+    PROXY_READY=0   # 每次部署重新解析代理 (局域网代理可能在两次部署间上线/下线)
 
     # 组装初始候选队列: 每项格式 "来源(local/online)|版本|ReleaseTag|文件名|路径或URL"
     if [ -n "${FORCED_LOCAL_QUEUE:-}" ]; then
@@ -526,14 +545,18 @@ deploy_flow() {
             NEED_ONLINE_FALLBACK=1
         else
             echo "本地缓存未命中精确版本 [$input_version]，转在线检索..."
+            ensure_proxy
             while IFS='|' read -r ver tag fname url; do
-                [ -n "$ver" ] && CANDIDATE_QUEUE+=("online|${ver}|${tag}|${fname}|${url}")
+                [[ "$ver" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ && "$tag" =~ ^[0-9]{8}$ && -n "$fname" ]] || continue
+                CANDIDATE_QUEUE+=("online|${ver}|${tag}|${fname}|${url}")
             done < <(query_upstream_candidates "$input_version")
         fi
     else
         # 大版本号 (如 3.12): 在线优先获取最新构建 (本地命中同名缓存免下载), 断网自动降级本地缓存
+        ensure_proxy
         while IFS='|' read -r ver tag fname url; do
-            [ -n "$ver" ] && CANDIDATE_QUEUE+=("online|${ver}|${tag}|${fname}|${url}")
+            [[ "$ver" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ && "$tag" =~ ^[0-9]{8}$ && -n "$fname" ]] || continue
+            CANDIDATE_QUEUE+=("online|${ver}|${tag}|${fname}|${url}")
         done < <(query_upstream_candidates "$input_version")
 
         # 强制在线 (o [版本]) 失败时不降级本地, 与 PyVersions.ps1 的严格 o 语义一致
@@ -557,6 +580,7 @@ deploy_flow() {
             return 1
         fi
         echo "安装 pyenv 基础环境..."
+        ensure_proxy
         rm -rf "$PYENV_ROOT"
         if ! git_clone_with_mirrors "https://github.com/pyenv/pyenv.git" "$PYENV_ROOT"; then
             echo "错误: 无法克隆 pyenv 仓库，请检查网络连接。"
@@ -593,8 +617,10 @@ EOF
     if [ "$DEPLOY_SUCCESS" -ne 1 ] && [ "$NEED_ONLINE_FALLBACK" -eq 1 ]; then
         echo "本地缓存未能成功部署 [$input_version]，触发在线检索兜底..."
         local ONLINE_QUEUE=()
+        ensure_proxy
         while IFS='|' read -r ver tag fname url; do
-            [ -n "$ver" ] && ONLINE_QUEUE+=("online|${ver}|${tag}|${fname}|${url}")
+            [[ "$ver" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ && "$tag" =~ ^[0-9]{8}$ && -n "$fname" ]] || continue
+            ONLINE_QUEUE+=("online|${ver}|${tag}|${fname}|${url}")
         done < <(query_upstream_candidates "$input_version")
 
         if [ ${#ONLINE_QUEUE[@]} -gt 0 ]; then
@@ -670,16 +696,25 @@ uninstall_version() {
 deploy_interactive() {
     list_local_cache_menu
     echo ""
-    echo "部署 Python (输入语义):"
+    echo "=================================================="
+    echo "部署 Python (本地缓存优先, 支持在线)"
+    echo "=================================================="
     if [ ${#LISTED_PATHS[@]} -gt 0 ]; then
-        local i=0 f base size_mb
+        echo "发现 ${#LISTED_PATHS[@]} 个可用的本地缓存包:"
+        local i=0 f base size_mb bdate
         for f in "${LISTED_PATHS[@]}"; do
             i=$((i + 1))
             base=$(basename "$f")
-            size_mb=$(( $(wc -c < "$f") / 1048576 ))
-            printf "  [%d] %s (%d MB)\n" "$i" "$base" "$size_mb"
+            size_mb=$(awk -v b="$(wc -c < "$f")" 'BEGIN{printf "%.1f", b/1048576}')
+            bdate=$(printf '%s' "$base" | grep -oE '\+[0-9]{8}' | head -n1 || true); bdate=${bdate#+}
+            bdate="${bdate:0:4}-${bdate:4:2}-${bdate:6:2}"
+            printf "  [%d] %s  (%s, 约 %s MB)\n" "$i" "$base" "$bdate" "$size_mb"
         done
+    else
+        echo "本地缓存包: 无 (将按输入在线检索)"
     fi
+    echo ""
+    echo "输入说明:"
     echo "  - 编号 (如 1)           -> 使用对应本地缓存包部署 (强制本地)"
     echo "  - 完整版本 (如 3.12.16) -> 优先使用本地缓存, 本地没有则在线查找"
     echo "  - 大版本 (如 3.12)      -> 在线获取该系列最新构建 (命中缓存免下载), 失败降级本地"
@@ -729,24 +764,11 @@ interactive_menu() {
     while true; do
         echo ""
         echo "  ======================================================"
-        echo "    PyVersions_pyenv  v1.8.0"
+        echo "    PyVersions_pyenv  v1.8.3"
         echo "    Python 独立版 (install_only) 管理工具 · pyenv 托管"
         echo "  ======================================================"
         echo "  pyenv 根目录: $PYENV_ROOT"
         echo "  本地缓存目录: $CACHE_DIR"
-        list_local_cache_menu
-        if [ ${#LISTED_PATHS[@]} -gt 0 ]; then
-            echo "  本地缓存包 (同版本仅显示最新):"
-            local i=0 f base size_mb
-            for f in "${LISTED_PATHS[@]}"; do
-                i=$((i + 1))
-                base=$(basename "$f")
-                size_mb=$(( $(wc -c < "$f") / 1048576 ))
-                printf "    [%d] %s (%d MB)\n" "$i" "$base" "$size_mb"
-            done
-        else
-            echo "  本地缓存包: 无"
-        fi
         echo ""
         echo "  [1] 部署 Python                  (本地缓存 + 在线下载, 自动选择)"
         echo "  [2] 卸载指定版本                 (pyenv uninstall)"

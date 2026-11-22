@@ -6,7 +6,7 @@ An interactive PowerShell tool to install, switch, and uninstall **standalone Py
 
 ```
   ======================================================
-    PyVersions  v1.8.0
+    PyVersions  v1.8.3
     Python 独立版 (install_only) 管理工具
   ======================================================
   当前权限: 管理员 (写入系统级注册表 / 系统 PATH)
@@ -22,7 +22,7 @@ An interactive PowerShell tool to install, switch, and uninstall **standalone Py
 - **Unified deploy (offline archives + online download in one flow)** — entering deploy lists the offline archives in the script directory and picks the source automatically: a number (`1`) forces the matching archive; an exact version (`3.12.16`) prefers local and falls back to online; a major version (`3.12`) goes **online-first** for the newest build (zero download when the archive is already cached) and degrades to local archives when offline; `o [version]` forces online; with no local archives it goes straight to online mode.
 - **Startup-argument deploy** — `PyVersions.ps1 3.12` / `PyVersions.ps1 3.12.16` deploy directly without the menu (same semantics as the interactive input); `-h` shows help. Exit code `0` on success / `1` on failure — script-friendly. Without arguments it enters the interactive menu.
 - **Zero-API version discovery** — the newest upstream build tags are resolved via the `releases/latest` HTTP 302 redirect plus `releases.atom` (immune to GitHub API rate limits); the GitHub API remains as a fallback covering old majors the atom feed may miss. Each tag's `SHA256SUMS` manifest (tens of KB) then yields the exact asset candidates.
-- **SHA256 integrity check** — every downloaded archive is verified against the upstream `SHA256SUMS` manifest; a bad archive is deleted and the next-newest candidate takes over. Manifests are cached per release tag (`SHA256SUMS-<tag>`) in the script directory.
+- **SHA256 integrity check** — every downloaded archive is verified against the upstream `SHA256SUMS` manifest; a bad archive is deleted and the next-newest candidate takes over. Manifests are cached per release tag (`SHA256SUMS-<tag>`) in the system temp directory (Windows `%TEMP%\PyVersions_sums`; Linux `/tmp/pyversions_sums-<uid>`).
 - **Cache governance** — after a successful deploy, older-date cached archives of the same exact version are pruned (only the one just used is kept); leftover temp extract dirs (`.py_deploy_*`) from crashed runs are swept automatically at the start of every deploy.
 - **LAN proxy acceleration** — before downloads, a list of LAN proxy candidates (200 ms TCP probe each) is tried first; the first reachable one is used as the download proxy. Falls back to the system proxy, then direct connection. Behavior is identical to the Linux sibling `PyVersions_pyenv.sh`.
 - **Resilient download** — automatic mirror fallback when GitHub direct fails (`ghfast.top`, `gh-proxy.com`); archives downloaded online are kept in the script directory and automatically become offline candidates next time (cache loop).

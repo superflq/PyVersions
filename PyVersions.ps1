@@ -1,5 +1,5 @@
 ﻿# =========================================================
-#  PyVersions  v1.8.0
+#  PyVersions  v1.8.3
 #  Python 独立版 (install_only) 多版本管理工具
 #  下载源: astral-sh/python-build-standalone (持续更新)
 #
@@ -317,10 +317,14 @@ function Set-DownloadProxy {
 
 # ====== 上游构建发现 (零 API 优先, 参考 PyVersions_pyenv.sh 统一策略) ======
 
-# 获取指定 Release tag 的 SHA256SUMS 清单 (脚本目录缓存复用, 仅几十 KB); 失败返回 $null
+# 获取指定 Release tag 的 SHA256SUMS 清单 (%TEMP%\PyVersions_sums 缓存复用, 仅几十 KB); 失败返回 $null
 function Get-SumsFile([string]$tag) {
     $pa = $script:CurlProxyArgs
-    $cached = Join-Path $PSScriptRoot "SHA256SUMS-$tag"
+    $sumsDir = Join-Path $env:TEMP "PyVersions_sums"
+    if (-not (Test-Path $sumsDir)) {
+        New-Item -ItemType Directory -Path $sumsDir -Force -ErrorAction SilentlyContinue | Out-Null
+    }
+    $cached = Join-Path $sumsDir "SHA256SUMS-$tag"
     if (Test-Path $cached) { return $cached }
     $sumsUrl = "https://github.com/astral-sh/python-build-standalone/releases/download/$tag/SHA256SUMS"
     foreach ($mirror in $DownloadMirrors) {
@@ -758,6 +762,9 @@ function Invoke-DeployPipeline([string]$archiveFilePath, [string]$destDir) {
     # 临时文件自动清理: 先清掉历史遗留的临时解压目录 (上次运行异常中断时可能残留)
     Get-ChildItem -Path $ExtractParentDir -Filter ".py_deploy_*" -Directory -Force -ErrorAction SilentlyContinue |
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    # 迁移清扫: v1.8.1 及之前 SHA256SUMS 清单缓存在脚本目录, 现统一存至 %TEMP%\PyVersions_sums
+    Get-ChildItem -Path $PSScriptRoot -Filter "SHA256SUMS-*" -File -Force -ErrorAction SilentlyContinue |
+        Remove-Item -Force -ErrorAction SilentlyContinue
 
     # 解压到临时目录 (不直接覆盖旧目录, 自检通过后再整体替换)
     $tempExtract = Join-Path $ExtractParentDir (".py_deploy_" + [guid]::NewGuid().ToString("N").Substring(0, 8))
@@ -1848,7 +1855,7 @@ function Show-MainMenu {
     Write-Host ""
     Write-Host "  ======================================================" -ForegroundColor Cyan
     Write-Host "    PyVersions  " -ForegroundColor Cyan -NoNewline
-    Write-Host "v1.8.0" -ForegroundColor Yellow
+    Write-Host "v1.8.3" -ForegroundColor Yellow
     Write-Host "    Python 独立版 (install_only) 管理工具" -ForegroundColor DarkGray
     Write-Host "  ======================================================" -ForegroundColor Cyan
     Write-Host "  当前权限: " -NoNewline
